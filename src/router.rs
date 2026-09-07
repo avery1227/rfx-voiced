@@ -73,6 +73,8 @@ pub struct Route {
     /// The current grant holder, if any. Talkgroups are GLOBAL, so this is the
     /// one place doubling is prevented across every server at once.
     pub keyed: Option<ClientId>,
+    /// A frequency rather than a talkgroup. Changes what keying means.
+    pub conventional: bool,
 }
 
 /// What happened to a key request. Preemption carries whoever was cut off, so
@@ -81,6 +83,11 @@ pub struct Route {
 pub enum Keyed {
     Granted,
     Preempted(ClientId),
+    /// Accepted on a conventional channel that somebody else is already
+    /// holding. NOT a refusal: the radio transmits, and is simply not heard
+    /// over the stronger signal. There is no bonk on conventional because
+    /// there is nothing to bonk you - no controller, no grant, nobody asked.
+    Doubled,
 }
 
 #[derive(Debug, Default)]
@@ -154,6 +161,19 @@ impl Router {
         fresh
     }
 
+    /// A conventional channel: a frequency, not a talkgroup.
+    ///
+    /// No controller, no grant, no slots. Two radios keying at once both
+    /// transmit, and what a listener hears is decided by physics rather than
+    /// by a system - which is the whole reason trunking was invented, and the
+    /// clearest possible demonstration of it to somebody holding a radio.
+    pub fn open_conventional(&mut self, id: u32) -> bool {
+        let fresh = !self.routes.contains_key(&id);
+        let route = self.routes.entry(id).or_default();
+        route.conventional = true;
+        fresh
+    }
+
     pub fn close(&mut self, tg: u32) -> bool {
         self.routes.remove(&tg).is_some()
     }
@@ -176,6 +196,16 @@ impl Router {
             // Already ours. A repeat inside hang time, which is a reply, not a
             // new transmission.
             Some(existing) if existing == client => Ok(Keyed::Granted),
+
+            // CAPTURE EFFECT. On FM the stronger signal wins outright and the
+            // weaker is not heard at all - not mixed, not garbled, simply
+            // absent. First-keyed stands in for stronger here, which is the
+            // right shape and costs nothing: the second radio transmits, is
+            // accepted, and nobody hears it.
+            //
+            // Notably it is NOT refused. A conventional radio has nothing to
+            // refuse it with.
+            Some(_) if route.conventional => Ok(Keyed::Doubled),
 
             Some(holder) => {
                 // DISPATCH PREEMPTS. A console takes a channel from a field

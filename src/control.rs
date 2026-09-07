@@ -320,6 +320,20 @@ fn dispatch(
     };
 
     match path {
+        // A frequency rather than a talkgroup. Same routing table - the id
+        // space is disjoint, so they cannot collide - but different rules
+        // about what keying means.
+        "conv.open" => match u32_of(body, "tg") {
+            Some(id) => {
+                let fresh = r.open_conventional(id);
+                if fresh {
+                    println!("CONV OPEN     {id}");
+                }
+                (200, json!({ "ok": true, "fresh": fresh }))
+            }
+            None => (400, json!({ "ok": false, "error": "tg required" })),
+        },
+
         "tg.open" => match u32_of(body, "tg") {
             Some(tg) => {
                 let encrypted = body
@@ -367,6 +381,14 @@ fn dispatch(
 
         "key" => match (u32_of(body, "tg"), client_of(server, body)) {
             (Some(tg), Some(client)) => match r.key(tg, client) {
+                Ok(crate::router::Keyed::Doubled) => {
+                    // Somebody else already holds this frequency. Accepted -
+                    // conventional has nothing to refuse with - but not heard,
+                    // and not announced as a call because it is not one.
+                    println!("DOUBLED      tg {tg} <- {client}");
+                    (200, json!({ "ok": true, "doubled": true }))
+                }
+
                 Ok(_) => {
                     // Tell consoles the moment the grant lands, before any
                     // audio exists. A console is a supervisory position: it
