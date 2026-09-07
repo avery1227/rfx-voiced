@@ -7,6 +7,7 @@
     "exported_at": "2026-09-07T00:00:00+00:00",
     "name": "InteropHQ Voice Node",
     "author": "avery627@gmail.com",
+    "uuid": "a1ace3f1-0d6a-4222-9bc7-6085c49c9c1e",
     "description": "rfx-voiced - the P25 voice node. Taps each FXServer's built-in Mumble server, runs the vocoder chain, and streams radio audio to game clients. Pulls its server list from InteropHQ when a platform key is set, and falls back to a local servers.json when it is not.",
     "features": null,
     "docker_images": {
