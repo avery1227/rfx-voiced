@@ -24,7 +24,12 @@ pub type Shared = Arc<Mutex<Router>>;
 /// restart.
 pub type SharedKeys = Arc<Mutex<KeyIndex>>;
 
-pub async fn serve(addr: String, router: Shared, streams: SharedStreams, keys: SharedKeys) -> Result<()> {
+pub async fn serve(
+    addr: String,
+    router: Shared,
+    streams: SharedStreams,
+    keys: SharedKeys,
+) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("control api listening on {addr}");
 
@@ -41,7 +46,12 @@ pub async fn serve(addr: String, router: Shared, streams: SharedStreams, keys: S
     }
 }
 
-async fn handle(mut socket: TcpStream, router: Shared, streams: SharedStreams, keys: SharedKeys) -> Result<()> {
+async fn handle(
+    mut socket: TcpStream,
+    router: Shared,
+    streams: SharedStreams,
+    keys: SharedKeys,
+) -> Result<()> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
 
@@ -87,7 +97,11 @@ async fn handle(mut socket: TcpStream, router: Shared, streams: SharedStreams, k
 
     let mut parts = request_line.split_whitespace();
     let _method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/").trim_start_matches('/').to_string();
+    let path = parts
+        .next()
+        .unwrap_or("/")
+        .trim_start_matches('/')
+        .to_string();
 
     let payload: Value = if body.is_empty() {
         json!({})
@@ -102,7 +116,12 @@ async fn handle(mut socket: TcpStream, router: Shared, streams: SharedStreams, k
     let presented = headers
         .get("x-rfx-key")
         .cloned()
-        .or_else(|| payload.get("key").and_then(|v| v.as_str()).map(String::from))
+        .or_else(|| {
+            payload
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
         .unwrap_or_default();
 
     let server = keys.lock().ok().and_then(|k| k.resolve(&presented));
@@ -131,7 +150,13 @@ fn client_of(server: u32, v: &Value) -> Option<ClientId> {
     Some(ClientId::new(server, u32_of(v, "client")?))
 }
 
-fn dispatch(path: &str, body: &Value, server: u32, router: &Shared, streams: &SharedStreams) -> (u16, Value) {
+fn dispatch(
+    path: &str,
+    body: &Value,
+    server: u32,
+    router: &Shared,
+    streams: &SharedStreams,
+) -> (u16, Value) {
     let mut r = match router.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -140,10 +165,16 @@ fn dispatch(path: &str, body: &Value, server: u32, router: &Shared, streams: &Sh
     match path {
         "tg.open" => match u32_of(body, "tg") {
             Some(tg) => {
-                let encrypted = body.get("encrypted").and_then(|v| v.as_bool()).unwrap_or(false);
+                let encrypted = body
+                    .get("encrypted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let fresh = r.open(tg, encrypted);
                 if fresh {
-                    println!("route open   tg {tg}{}", if encrypted { " (encrypted)" } else { "" });
+                    println!(
+                        "route open   tg {tg}{}",
+                        if encrypted { " (encrypted)" } else { "" }
+                    );
                 }
                 (200, json!({ "ok": true, "fresh": fresh }))
             }
@@ -162,13 +193,19 @@ fn dispatch(path: &str, body: &Value, server: u32, router: &Shared, streams: &Sh
 
         "tg.member" => match (u32_of(body, "tg"), client_of(server, body)) {
             (Some(tg), Some(client)) => {
-                let listen = body.get("listen").and_then(|v| v.as_bool()).unwrap_or(false);
+                let listen = body
+                    .get("listen")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 // 0..100, where 100 is full quieting.
                 let quality = u32_of(body, "quality").unwrap_or(100).min(100) as u8;
                 r.set_member(tg, client, listen, quality);
                 (200, json!({ "ok": true }))
             }
-            _ => (400, json!({ "ok": false, "error": "tg, server and client required" })),
+            _ => (
+                400,
+                json!({ "ok": false, "error": "tg, server and client required" }),
+            ),
         },
 
         "key" => match (u32_of(body, "tg"), client_of(server, body)) {
@@ -177,7 +214,11 @@ fn dispatch(path: &str, body: &Value, server: u32, router: &Shared, streams: &Sh
                     let bound = r.session_of(client).is_some();
                     println!(
                         "KEY          tg {tg} <- {client}{}",
-                        if bound { "" } else { "  (no mumble session bound yet)" }
+                        if bound {
+                            ""
+                        } else {
+                            "  (no mumble session bound yet)"
+                        }
                     );
                     (200, json!({ "ok": true, "bound": bound }))
                 }
@@ -189,7 +230,10 @@ fn dispatch(path: &str, body: &Value, server: u32, router: &Shared, streams: &Sh
                     (409, json!({ "ok": false, "error": e }))
                 }
             },
-            _ => (400, json!({ "ok": false, "error": "tg, server and client required" })),
+            _ => (
+                400,
+                json!({ "ok": false, "error": "tg, server and client required" }),
+            ),
         },
 
         "unkey" => match u32_of(body, "tg") {
@@ -204,7 +248,10 @@ fn dispatch(path: &str, body: &Value, server: u32, router: &Shared, streams: &Sh
         // FXServer mints a token per player and passes the same value to that
         // player's NUI. Without this the audio socket would be an open scanner
         // feed of every talkgroup on the system.
-        "session.token" => match (client_of(server, body), body.get("token").and_then(|v| v.as_str())) {
+        "session.token" => match (
+            client_of(server, body),
+            body.get("token").and_then(|v| v.as_str()),
+        ) {
             (Some(client), Some(token)) if !token.is_empty() => {
                 if let Ok(mut s) = streams.lock() {
                     s.authorize(token.to_string(), client);
@@ -212,7 +259,10 @@ fn dispatch(path: &str, body: &Value, server: u32, router: &Shared, streams: &Sh
                 println!("token issued for {client}");
                 (200, json!({ "ok": true }))
             }
-            _ => (400, json!({ "ok": false, "error": "server, client and non-empty token required" })),
+            _ => (
+                400,
+                json!({ "ok": false, "error": "server, client and non-empty token required" }),
+            ),
         },
 
         "session.drop" => match client_of(server, body) {
@@ -222,20 +272,29 @@ fn dispatch(path: &str, body: &Value, server: u32, router: &Shared, streams: &Sh
                 }
                 (200, json!({ "ok": true }))
             }
-            None => (400, json!({ "ok": false, "error": "server and client required" })),
+            None => (
+                400,
+                json!({ "ok": false, "error": "server and client required" }),
+            ),
         },
 
         "stats" => {
             let connected = streams.lock().map(|s| s.connected()).unwrap_or(0);
-            (200, json!({
-                "ok": true,
-                "server": server,
-                "summary": r.summary(),
-                "streams": connected,
-            }))
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "server": server,
+                    "summary": r.summary(),
+                    "streams": connected,
+                }),
+            )
         }
 
-        other => (404, json!({ "ok": false, "error": format!("unknown endpoint {other}") })),
+        other => (
+            404,
+            json!({ "ok": false, "error": format!("unknown endpoint {other}") }),
+        ),
     }
 }
 

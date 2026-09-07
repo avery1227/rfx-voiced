@@ -21,6 +21,22 @@ Two listeners, and they have different exposure:
 | `VOICED_CONTROL` | `127.0.0.1:8787` | FXServers only |
 | `VOICED_STREAM` | `0.0.0.0:8788` | Players' game clients — must be public |
 
+### Deploy once, then leave it alone
+
+With a platform key set there is **nothing to enrol and nothing to restart**.
+The node polls the platform every `VOICED_POLL_SECONDS` (default 60) and
+reconciles what it finds: it attaches taps for servers that appeared, detaches
+servers that went away, and rebuilds its key index so a server added a minute
+ago can authenticate immediately.
+
+A node deployed before any server exists is not an error - it comes up, serves
+nothing, and attaches when servers appear. A server that changes host or port
+is treated as gone and then new, because reconnecting forever to an address
+that no longer serves it is the failure that looks most like working.
+
+A failed poll keeps the last good list rather than emptying it, so an
+unreachable dashboard does not detach every server on the network.
+
 Where its server list comes from, in order of preference:
 
 1. The platform, when `VOICED_PLATFORM_URL` and `VOICED_PLATFORM_KEY` are set.
@@ -41,8 +57,12 @@ compromised node cannot impersonate the servers it serves.
 | `VOICED_CODEC2_MODE` | `3200` | 3200 or 2400 |
 | `VOICED_CACHE` | `servers.cache.json` | |
 | `VOICED_STORE` | `servers.json` | |
+| `VOICED_POLL_SECONDS` | `60` | How often the server list is reconciled |
 
 ### Standalone
+
+Only for running with **no platform**. With `VOICED_PLATFORM_URL` set, servers
+come from the dashboard and none of this is needed.
 
 ```
 rfx-voiced enroll <name> <host:port>   add a server, print its key
@@ -71,3 +91,14 @@ cargo build --release
 install and the startup command runs the binary, rather than recompiling on
 every boot. It needs **two allocations**: the primary is the control API, and
 a second one — set in the `VOICED_STREAM_PORT` variable — is the audio stream.
+
+## Releases
+
+Tagging `v*` builds a Linux x86_64 binary, attaches it and the Pelican egg to a
+GitHub release, and pushes a container image to `ghcr.io`. Releases are cut
+from tags rather than from every commit, because "which version is that node
+running" is the first question anyone asks when one misbehaves.
+
+```
+git tag -a v0.1.0 -m "First release" && git push origin v0.1.0
+```

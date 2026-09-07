@@ -18,6 +18,7 @@
 //! within one server, and treating them as global puts audio on the wrong
 //! continent.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,7 +49,10 @@ fn cli(args: &[String]) -> Result<bool> {
     match args.first().map(String::as_str) {
         Some("enroll") => {
             let name = args.get(1).cloned().unwrap_or_else(|| "unnamed".into());
-            let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:30120".into());
+            let addr = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:30120".into());
             let (host, port) = match addr.rsplit_once(':') {
                 Some((h, p)) => (h.to_string(), p.parse().unwrap_or(30120)),
                 None => (addr.clone(), 30120u16),
@@ -78,16 +82,22 @@ fn cli(args: &[String]) -> Result<bool> {
             for s in &store.servers {
                 println!(
                     "{:>3}  {:<24} {}:{:<6} {}  key {}...{}",
-                    s.id, s.name, s.host, s.port,
+                    s.id,
+                    s.name,
+                    s.host,
+                    s.port,
                     if s.enabled { "enabled " } else { "DISABLED" },
-                    &s.key[..8], &s.key[s.key.len() - 4..]
+                    &s.key[..8],
+                    &s.key[s.key.len() - 4..]
                 );
             }
             Ok(true)
         }
 
         Some("rotate") => {
-            let id: u32 = args.get(1).and_then(|v| v.parse().ok())
+            let id: u32 = args
+                .get(1)
+                .and_then(|v| v.parse().ok())
                 .ok_or_else(|| anyhow::anyhow!("usage: rotate <server id>"))?;
             match store.rotate(id)? {
                 Some(s) => {
@@ -101,7 +111,9 @@ fn cli(args: &[String]) -> Result<bool> {
         }
 
         Some("revoke") => {
-            let id: u32 = args.get(1).and_then(|v| v.parse().ok())
+            let id: u32 = args
+                .get(1)
+                .and_then(|v| v.parse().ok())
                 .ok_or_else(|| anyhow::anyhow!("usage: revoke <server id>"))?;
             if store.revoke(id) {
                 store.save(&path)?;
@@ -137,23 +149,32 @@ async fn main() -> Result<()> {
     // The platform is the source of truth when it is configured. When it is
     // not - or when it is unreachable and there is no cache - the local store
     // is what runs, which is how a node works standalone.
-    let plat = platform::Platform::from_env();
+    // Behind an Arc because two long-lived tasks need it: the heartbeat and
+    // the supervisor. Platform holds only a client and config, so sharing one
+    // is also the right thing - a second reqwest client would mean a second
+    // connection pool to the same host.
+    let plat = platform::Platform::from_env().map(Arc::new);
 
     let (enrolled, source) = match &plat {
         Some(p) => p.resolve().await,
         None => (platform::local_servers()?, "servers.json"),
     };
 
+    // An empty list is NOT fatal. A node deployed with a valid key before any
+    // server has been added is correctly configured and simply has nothing to
+    // do yet; exiting would put it in a restart loop until somebody happened
+    // to add a server, and the operator would see a crashing node rather than
+    // an idle one. It comes up, serves nothing, and attaches when the platform
+    // starts listing servers.
+    println!("{} server(s) from {source}", enrolled.len());
     if enrolled.is_empty() {
-        anyhow::bail!(
-            "no servers to serve (source: {source}). Either set VOICED_PLATFORM_URL              and VOICED_PLATFORM_KEY, or run:  rfx-voiced enroll <name> <host:port>"
+        println!(
+            "nothing to serve yet - waiting for servers. Add one on the dashboard, \
+             or run: rfx-voiced enroll <name> <host:port>"
         );
     }
 
-    println!("{} server(s) from {source}", enrolled.len());
-
-    let keys: control::SharedKeys =
-        Arc::new(Mutex::new(servers::KeyIndex::build(enrolled.iter())));
+    let keys: control::SharedKeys = Arc::new(Mutex::new(servers::KeyIndex::build(enrolled.iter())));
 
     let control_addr = env_or("VOICED_CONTROL", "127.0.0.1:8787");
     // Players' game clients connect here, so unlike the control port this one
@@ -186,12 +207,14 @@ async fn main() -> Result<()> {
     // Telemetry: liveness for the dashboard, and the numbers behind the
     // Discord embed. Best effort throughout - a reporting failure must never
     // be able to interrupt audio.
-    if let Some(p) = plat {
+    // What the node is tapping right now. Shared, because the supervisor below
+    // changes it while the heartbeat is reading it.
+    let attached: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    if let Some(p) = &plat {
         let shared = shared.clone();
-        // Every server we are ATTACHED to, not only the ones with activity.
-        // Liveness is the point: an idle server is still online, and reporting
-        // only busy ones leaves a working server reading "never seen".
-        let attached: Vec<u32> = enrolled.iter().map(|s| s.id).collect();
+        let attached = attached.clone();
+        let p = Arc::clone(p);
 
         tokio::spawn(async move {
             // First report immediately. Waiting a full minute to say hello
@@ -205,10 +228,20 @@ async fn main() -> Result<()> {
                     Err(_) => continue,
                 };
 
-                let rows: Vec<(u32, u32, u32, u32)> = attached
+                // Every server we are ATTACHED to, not only the ones with
+                // activity. Liveness is the point: an idle server is still
+                // online, and reporting only busy ones leaves a working server
+                // reading "never seen".
+                let ids: Vec<u32> = match attached.lock() {
+                    Ok(a) => a.iter().copied().collect(),
+                    Err(_) => continue,
+                };
+
+                let rows: Vec<(u32, u32, u32, u32)> = ids
                     .iter()
                     .map(|&id| {
-                        let (players, radios, talkers) = stats.get(&id).copied().unwrap_or((0, 0, 0));
+                        let (players, radios, talkers) =
+                            stats.get(&id).copied().unwrap_or((0, 0, 0));
                         (id, players, radios, talkers)
                     })
                     .collect();
@@ -221,45 +254,147 @@ async fn main() -> Result<()> {
     let user = env_or("VOICED_USER", "[999] radiotap");
     let pass = env_or("VOICED_PASS", "");
 
-    let mut taps = Vec::new();
-    for s in enrolled {
-        let settings = mumble::Settings {
-            server: s.id,
-            host: s.host.clone(),
-            port: s.port,
-            username: user.clone(),
-            password: pass.clone(),
-        };
+    let poll = env_or("VOICED_POLL_SECONDS", "60")
+        .parse::<u64>()
+        .unwrap_or(60);
+
+    // ----------------------------------------------------------------------
+    // The supervisor.
+    //
+    // The server list is not read once at boot. A node is deployed with a key
+    // and then left alone: servers are added and removed on the dashboard
+    // afterwards, and a node that only ever saw the list it started with would
+    // need a restart - and therefore an operator - every time. Nothing about
+    // running this should require touching the box.
+    //
+    // Each poll reconciles three things against the platform:
+    //
+    //   * the KEY INDEX, so a server added a minute ago can authenticate.
+    //     Without this a new server's first call is refused with "no such
+    //     route" and its radios sit dead until somebody restarts the node;
+    //   * the TAPS, attaching new servers and detaching gone ones;
+    //   * the ATTACHED set the heartbeat reports.
+    //
+    // A server whose host or port CHANGED counts as gone and then new: the tap
+    // is pointed at an address that no longer serves it, and reconnecting to
+    // the old one forever is the failure that looks most like working.
+    // ----------------------------------------------------------------------
+    {
         let shared = shared.clone();
         let streams = streams.clone();
+        let keys = keys.clone();
+        let attached = attached.clone();
+        let plat = plat.clone();
 
-        taps.push(tokio::spawn(async move {
-            // Each tap reconnects on its own. One FXServer restarting must not
-            // disturb the others, and on the target host nobody is watching to
-            // restart this process by hand.
+        tokio::spawn(async move {
+            let mut taps: HashMap<u32, tokio::task::JoinHandle<()>> = HashMap::new();
+            let mut known: HashMap<u32, (String, u16)> = HashMap::new();
+
+            // The first pass uses the list already fetched at startup, so the
+            // node does not sit silent for a poll interval before attaching.
+            let mut list = enrolled;
+
             loop {
-                match mumble::run(&settings, shared.clone(), streams.clone()).await {
-                    Ok(()) => println!("[server {}] tap closed cleanly", settings.server),
-                    Err(e) => eprintln!("[server {}] tap: {e:#}", settings.server),
+                let want: HashMap<u32, (String, u16)> = list
+                    .iter()
+                    .map(|s| (s.id, (s.host.clone(), s.port)))
+                    .collect();
+
+                if let Ok(mut k) = keys.lock() {
+                    *k = servers::KeyIndex::build(list.iter());
                 }
 
-                // Drop only THIS server's identities and routes. Everyone else
-                // on the platform keeps talking.
-                if let Ok(mut r) = shared.lock() {
-                    r.drop_server(settings.server);
-                }
-                if let Ok(mut s) = streams.lock() {
-                    s.drop_server(settings.server);
+                let stale: Vec<u32> = taps
+                    .keys()
+                    .copied()
+                    .filter(|id| want.get(id) != known.get(id))
+                    .collect();
+
+                for id in stale {
+                    if let Some(h) = taps.remove(&id) {
+                        h.abort();
+                    }
+                    known.remove(&id);
+
+                    // Drop only THIS server's identities and routes. Everyone
+                    // else on the platform keeps talking.
+                    if let Ok(mut r) = shared.lock() {
+                        r.drop_server(id);
+                    }
+                    if let Ok(mut s) = streams.lock() {
+                        s.drop_server(id);
+                    }
+                    if let Ok(mut a) = attached.lock() {
+                        a.remove(&id);
+                    }
+                    println!("server {id} detached");
                 }
 
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                for (id, (host, port)) in &want {
+                    if taps.contains_key(id) {
+                        continue;
+                    }
+
+                    let settings = mumble::Settings {
+                        server: *id,
+                        host: host.clone(),
+                        port: *port,
+                        username: user.clone(),
+                        password: pass.clone(),
+                    };
+                    let shared = shared.clone();
+                    let streams = streams.clone();
+
+                    let handle = tokio::spawn(async move {
+                        // Each tap reconnects on its own. One FXServer
+                        // restarting must not disturb the others, and on the
+                        // target host nobody is watching to restart this by
+                        // hand.
+                        loop {
+                            match mumble::run(&settings, shared.clone(), streams.clone()).await {
+                                Ok(()) => {
+                                    println!("[server {}] tap closed cleanly", settings.server)
+                                }
+                                Err(e) => eprintln!("[server {}] tap: {e:#}", settings.server),
+                            }
+
+                            if let Ok(mut r) = shared.lock() {
+                                r.drop_server(settings.server);
+                            }
+                            if let Ok(mut s) = streams.lock() {
+                                s.drop_server(settings.server);
+                            }
+
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                    });
+
+                    taps.insert(*id, handle);
+                    known.insert(*id, (host.clone(), *port));
+                    if let Ok(mut a) = attached.lock() {
+                        a.insert(*id);
+                    }
+                    println!("server {id} attached ({host}:{port})");
+                }
+
+                tokio::time::sleep(Duration::from_secs(poll)).await;
+
+                // Re-read for the next pass. A failed pull returns the cached
+                // list rather than an empty one, so an unreachable dashboard
+                // does not detach every server on the network.
+                list = match &plat {
+                    Some(p) => p.resolve().await.0,
+                    None => platform::local_servers().unwrap_or_default(),
+                };
             }
-        }));
+        });
     }
 
-    for tap in taps {
-        let _ = tap.await;
-    }
+    // The egg stops this with SIGINT, and the taps close their connections on
+    // the way out. A killed node leaves every FXServer holding routes to a
+    // process that is gone.
+    tokio::signal::ctrl_c().await?;
+    println!("shutting down");
     Ok(())
 }
 

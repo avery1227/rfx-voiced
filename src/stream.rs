@@ -78,7 +78,9 @@ impl Streams {
     /// backed up. Late radio audio is worse than missing radio audio - a
     /// stalled listener must never hold up the vocoder for everyone else.
     pub fn send_pcm(&mut self, client: ClientId, tg: u32, pcm: &[i16]) {
-        let Some(sink) = self.sinks.get(&client) else { return };
+        let Some(sink) = self.sinks.get(&client) else {
+            return;
+        };
 
         let mut frame = Vec::with_capacity(AUDIO_HEADER + pcm.len() * 2);
         frame.push(KIND_AUDIO);
@@ -108,17 +110,18 @@ pub async fn serve(addr: String, streams: SharedStreams) -> Result<()> {
             let token = Arc::new(Mutex::new(None::<String>));
             let captured = token.clone();
 
-            let ws = tokio_tungstenite::accept_hdr_async(socket, move |req: &Request, res: Response| {
-                if let Some(q) = req.uri().query() {
-                    for pair in q.split('&') {
-                        if let Some(v) = pair.strip_prefix("token=") {
-                            *captured.lock().unwrap() = Some(v.to_string());
+            let ws =
+                tokio_tungstenite::accept_hdr_async(socket, move |req: &Request, res: Response| {
+                    if let Some(q) = req.uri().query() {
+                        for pair in q.split('&') {
+                            if let Some(v) = pair.strip_prefix("token=") {
+                                *captured.lock().unwrap() = Some(v.to_string());
+                            }
                         }
                     }
-                }
-                Ok(res)
-            })
-            .await;
+                    Ok(res)
+                })
+                .await;
 
             let Ok(ws) = ws else { return };
 

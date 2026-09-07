@@ -243,8 +243,12 @@ mod tests {
     const A: u32 = 1; // server A
     const B: u32 = 2; // server B
 
-    fn sess(server: u32, s: u32) -> SessionId { SessionId::new(server, s) }
-    fn cli(server: u32, p: u32) -> ClientId { ClientId::new(server, p) }
+    fn sess(server: u32, s: u32) -> SessionId {
+        SessionId::new(server, s)
+    }
+    fn cli(server: u32, p: u32) -> ClientId {
+        ClientId::new(server, p)
+    }
 
     #[test]
     fn parses_the_fivem_username_prefix() {
@@ -312,7 +316,11 @@ mod tests {
         r.key(1001, cli(A, 5)).unwrap();
         let (tg, listeners) = r.destination(sess(A, 3)).expect("keyed speech routes");
         assert_eq!(tg, 1001);
-        assert_eq!(listeners, vec![(cli(A, 9), 100)], "the speaker is not a listener");
+        assert_eq!(
+            listeners,
+            vec![(cli(A, 9), 100)],
+            "the speaker is not a listener"
+        );
     }
 
     #[test]
@@ -325,7 +333,10 @@ mod tests {
         r.key(9001, cli(A, 5)).unwrap();
 
         let (_, listeners) = r.destination(sess(A, 3)).unwrap();
-        assert!(listeners.is_empty(), "an unentitled member is never sent audio");
+        assert!(
+            listeners.is_empty(),
+            "an unentitled member is never sent audio"
+        );
     }
 
     #[test]
@@ -353,7 +364,11 @@ mod tests {
         r.drop_server(A);
 
         assert!(r.client_of(sess(A, 1)).is_none(), "server A is gone");
-        assert_eq!(r.client_of(sess(B, 1)), Some(cli(B, 5)), "server B is untouched");
+        assert_eq!(
+            r.client_of(sess(B, 1)),
+            Some(cli(B, 5)),
+            "server B is untouched"
+        );
         assert!(r.key(1001, cli(B, 5)).is_ok(), "and the talkgroup is free");
     }
 }

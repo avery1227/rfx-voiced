@@ -105,9 +105,14 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         use rustls::SignatureScheme::*;
         vec![
-            RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512,
-            ECDSA_NISTP256_SHA256, ECDSA_NISTP384_SHA384,
-            RSA_PSS_SHA256, RSA_PSS_SHA384, RSA_PSS_SHA512,
+            RSA_PKCS1_SHA256,
+            RSA_PKCS1_SHA384,
+            RSA_PKCS1_SHA512,
+            ECDSA_NISTP256_SHA256,
+            ECDSA_NISTP384_SHA384,
+            RSA_PSS_SHA256,
+            RSA_PSS_SHA384,
+            RSA_PSS_SHA512,
             ED25519,
         ]
     }
@@ -156,7 +161,13 @@ fn parse_voice(data: &[u8]) -> Option<VoicePacket> {
         return None;
     }
 
-    Some(VoicePacket { codec, target: header & 0x1f, session, payload_start, payload_len })
+    Some(VoicePacket {
+        codec,
+        target: header & 0x1f,
+        session,
+        payload_start,
+        payload_len,
+    })
 }
 
 /// FiveM's voice client does not set the Opus terminator bit - it simply stops
@@ -198,7 +209,10 @@ pub async fn run(cfg: &Settings, router: Shared, streams: SharedStreams) -> Resu
         .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
 
-    println!("[server {}] connecting to {}:{} as {:?}", cfg.server, cfg.host, cfg.port, cfg.username);
+    println!(
+        "[server {}] connecting to {}:{} as {:?}",
+        cfg.server, cfg.host, cfg.port, cfg.username
+    );
 
     let tcp = tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port))
         .await
@@ -206,7 +220,10 @@ pub async fn run(cfg: &Settings, router: Shared, streams: SharedStreams) -> Resu
     tcp.set_nodelay(true)?;
 
     let server_name = rustls_pki_types::ServerName::try_from("mumble")?.to_owned();
-    let stream = connector.connect(server_name, tcp).await.context("tls handshake")?;
+    let stream = connector
+        .connect(server_name, tcp)
+        .await
+        .context("tls handshake")?;
     println!("tls established");
 
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -225,7 +242,6 @@ pub async fn run(cfg: &Settings, router: Shared, streams: SharedStreams) -> Resu
         release: Some("rfx-voiced".into()),
         os: Some(std::env::consts::OS.into()),
         os_version: Some("0.1".into()),
-        ..Default::default()
     };
     tx.send((msg::VERSION, version.encode_to_vec())).await?;
 
@@ -245,7 +261,11 @@ pub async fn run(cfg: &Settings, router: Shared, streams: SharedStreams) -> Resu
             loop {
                 tick.tick().await;
                 seq = seq.wrapping_add(1);
-                if tx.send((msg::UDP_TUNNEL, keepalive_frame(seq))).await.is_err() {
+                if tx
+                    .send((msg::UDP_TUNNEL, keepalive_frame(seq)))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -258,7 +278,10 @@ pub async fn run(cfg: &Settings, router: Shared, streams: SharedStreams) -> Resu
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {
                 tick.tick().await;
-                let ping = proto::Ping { timestamp: Some(0), ..Default::default() };
+                let ping = proto::Ping {
+                    timestamp: Some(0),
+                    ..Default::default()
+                };
                 if tx.send((msg::PING, ping.encode_to_vec())).await.is_err() {
                     break;
                 }

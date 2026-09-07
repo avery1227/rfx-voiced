@@ -62,8 +62,15 @@ fn codec2_mode() -> Codec2Mode {
 
 /// RBJ biquad, used here as a 2nd-order high-pass.
 struct Biquad {
-    b0: f32, b1: f32, b2: f32, a1: f32, a2: f32,
-    x1: f32, x2: f32, y1: f32, y2: f32,
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
 }
 
 impl Biquad {
@@ -80,9 +87,15 @@ impl Biquad {
         let a2 = 1.0 - alpha;
 
         Self {
-            b0: b0 / a0, b1: b1 / a0, b2: b2 / a0,
-            a1: a1 / a0, a2: a2 / a0,
-            x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
         }
     }
 
@@ -99,9 +112,15 @@ impl Biquad {
         let a2 = 1.0 - alpha;
 
         Self {
-            b0: b0 / a0, b1: b1 / a0, b2: b2 / a0,
-            a1: a1 / a0, a2: a2 / a0,
-            x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
         }
     }
 
@@ -121,15 +140,22 @@ impl Biquad {
         let a2 = 1.0 - alpha / a;
 
         Self {
-            b0: b0 / a0, b1: b1 / a0, b2: b2 / a0,
-            a1: a1 / a0, a2: a2 / a0,
-            x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
         }
     }
 
     fn run(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
-            - self.a1 * self.y1 - self.a2 * self.y2;
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
         self.x2 = self.x1;
         self.x1 = x;
         self.y2 = self.y1;
@@ -234,7 +260,12 @@ impl Agc {
     const GATE_CLOSE: f32 = 110.0;
 
     fn new() -> Self {
-        Self { gain: 1.0, envelope: 0.0, gate: 0.0, open: false }
+        Self {
+            gain: 1.0,
+            envelope: 0.0,
+            gate: 0.0,
+            open: false,
+        }
     }
 
     fn run(&mut self, frame: &mut [f32]) {
@@ -247,7 +278,9 @@ impl Agc {
         self.envelope += a * (rms - self.envelope);
 
         if self.open {
-            if self.envelope < Self::GATE_CLOSE { self.open = false; }
+            if self.envelope < Self::GATE_CLOSE {
+                self.open = false;
+            }
         } else if self.envelope > Self::GATE_OPEN {
             self.open = true;
         }
@@ -260,8 +293,8 @@ impl Agc {
 
         // Only chase the level while there is speech to chase.
         if self.open {
-            let want = (Self::TARGET / self.envelope.max(1.0))
-                .clamp(Self::MIN_GAIN, Self::MAX_GAIN);
+            let want =
+                (Self::TARGET / self.envelope.max(1.0)).clamp(Self::MIN_GAIN, Self::MAX_GAIN);
             self.gain += 0.1 * (want - self.gain);
         }
 
@@ -301,11 +334,11 @@ pub struct ErrorProfile {
 /// about 3 dB. Most of the interesting behaviour lives between 40 and 10.
 const CURVE: &[(f32, f32, f32)] = &[
     (100.0, 0.000, 0.0),
-    (90.0,  0.005, 1.0),
-    (75.0,  0.030, 2.0),
-    (55.0,  0.120, 3.0),
-    (30.0,  0.350, 6.0),
-    (10.0,  0.600, 8.0),
+    (90.0, 0.005, 1.0),
+    (75.0, 0.030, 2.0),
+    (55.0, 0.120, 3.0),
+    (30.0, 0.350, 6.0),
+    (10.0, 0.600, 8.0),
 ];
 
 /// Below this nothing decodes at all. SILENCE, never static - a receiver under
@@ -321,7 +354,9 @@ pub const LANE_STEP: u8 = 5;
 
 pub fn lane_of(quality: u8) -> u8 {
     let q = quality.min(100);
-    if q <= DECODE_FLOOR { return 0; }
+    if q <= DECODE_FLOOR {
+        return 0;
+    }
     ((q + LANE_STEP / 2) / LANE_STEP) * LANE_STEP
 }
 
@@ -329,10 +364,18 @@ pub fn profile(quality: u8) -> ErrorProfile {
     let q = quality.min(100) as f32;
 
     if quality <= DECODE_FLOOR {
-        return ErrorProfile { erasure: 1.0, bit_errors: 0, muted: true };
+        return ErrorProfile {
+            erasure: 1.0,
+            bit_errors: 0,
+            muted: true,
+        };
     }
     if q >= CURVE[0].0 {
-        return ErrorProfile { erasure: CURVE[0].1, bit_errors: 0, muted: false };
+        return ErrorProfile {
+            erasure: CURVE[0].1,
+            bit_errors: 0,
+            muted: false,
+        };
     }
 
     for w in CURVE.windows(2) {
@@ -350,7 +393,11 @@ pub fn profile(quality: u8) -> ErrorProfile {
 
     // Below the last anchor but above the floor: worst decodable signal.
     let last = CURVE[CURVE.len() - 1];
-    ErrorProfile { erasure: last.1, bit_errors: last.2 as u32, muted: false }
+    ErrorProfile {
+        erasure: last.1,
+        bit_errors: last.2 as u32,
+        muted: false,
+    }
 }
 
 /// xorshift64*, so the error model needs no `rand` dependency and is
@@ -367,8 +414,12 @@ impl Rng {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
     fn chance(&mut self, p: f32) -> bool {
-        if p <= 0.0 { return false; }
-        if p >= 1.0 { return true; }
+        if p <= 0.0 {
+            return false;
+        }
+        if p >= 1.0 {
+            return true;
+        }
         ((self.next() >> 11) as f64 / (1u64 << 53) as f64) < p as f64
     }
     fn below(&mut self, n: u32) -> u32 {
@@ -415,7 +466,11 @@ impl Decimator {
             *t /= sum;
         }
 
-        Self { taps, history: vec![0.0; N], phase: 0 }
+        Self {
+            taps,
+            history: vec![0.0; N],
+            phase: 0,
+        }
     }
 
     /// Feeds 48 kHz samples, emits 8 kHz samples (one per six in).
@@ -485,7 +540,7 @@ pub struct Talker {
 impl Talker {
     pub fn new() -> Result<Self> {
         let encoder = Codec2::new(codec2_mode());
-        let frame_bytes = (encoder.bits_per_frame() + 7) / 8;
+        let frame_bytes = encoder.bits_per_frame().div_ceil(8);
         Ok(Self {
             // FiveM encodes at 48 kHz mono.
             opus_in: opus::Decoder::new(48000, opus::Channels::Mono)?,
@@ -508,11 +563,7 @@ impl Talker {
     /// samples, nothing - because that is what a receiver below threshold does.
     /// `qualities` are 0..100 link-quality values, one per listener. They are
     /// grouped to lanes internally, so passing forty is fine.
-    pub fn push(
-        &mut self,
-        opus_packet: &[u8],
-        qualities: &[u8],
-    ) -> Result<Vec<(u8, Vec<i16>)>> {
+    pub fn push(&mut self, opus_packet: &[u8], qualities: &[u8]) -> Result<Vec<(u8, Vec<i16>)>> {
         // 48 kHz mono, worst case 60 ms.
         let mut wide = vec![0i16; 48000 * 60 / 1000];
         let n = self.opus_in.decode(opus_packet, &mut wide, false)?;
@@ -613,7 +664,11 @@ mod tests {
             let e = profile(q).erasure;
             assert!((0.0..=1.0).contains(&e), "erasure out of range at {q}");
             if last >= 0.0 {
-                assert!(e <= last + 1e-6, "quality {q} must not be worse than {}", q - 1);
+                assert!(
+                    e <= last + 1e-6,
+                    "quality {q} must not be worse than {}",
+                    q - 1
+                );
             }
             last = e;
         }
@@ -659,8 +714,15 @@ mod tests {
         d.push(&alias, &mut out);
 
         let settled = &out[out.len() / 2..];
-        let peak = settled.iter().map(|s| s.unsigned_abs() as u32).max().unwrap_or(0);
-        assert!(peak < 1600, "out-of-band tone should be attenuated, peak was {peak}");
+        let peak = settled
+            .iter()
+            .map(|s| s.unsigned_abs() as u32)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            peak < 1600,
+            "out-of-band tone should be attenuated, peak was {peak}"
+        );
     }
 
     #[test]
@@ -674,8 +736,15 @@ mod tests {
 
         let out = t.push(&packet, &[100, 0])?;
 
-        let clean = out.iter().find(|(q, _)| *q == 100).expect("quality 100 is served");
-        assert_eq!(clean.1.len(), 2 * FRAME, "40 ms yields two 20 ms vocoder frames");
+        let clean = out
+            .iter()
+            .find(|(q, _)| *q == 100)
+            .expect("quality 100 is served");
+        assert_eq!(
+            clean.1.len(),
+            2 * FRAME,
+            "40 ms yields two 20 ms vocoder frames"
+        );
         assert!(clean.1.iter().any(|s| *s != 0), "and it is not silence");
 
         assert!(
@@ -706,7 +775,10 @@ mod tests {
             }
         }
 
-        assert!(differed, "quality 30 must not sound identical to quality 100");
+        assert!(
+            differed,
+            "quality 30 must not sound identical to quality 100"
+        );
         Ok(())
     }
 }

@@ -56,8 +56,8 @@ impl Store {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -106,7 +106,6 @@ impl Store {
     pub fn enabled(&self) -> impl Iterator<Item = &Server> {
         self.servers.iter().filter(|s| s.enabled)
     }
-
 }
 
 #[derive(Debug, Default, Clone)]
@@ -146,7 +145,6 @@ impl KeyIndex {
         }
         found
     }
-
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -191,7 +189,10 @@ mod tests {
         assert_eq!(b.id, 2, "ids are assigned, never chosen by the server");
         assert_ne!(a.key, b.key);
         assert_eq!(a.key.len(), 64, "256 bits, hex");
-        assert!(a.key_hash.is_none(), "a locally enrolled server holds the key itself");
+        assert!(
+            a.key_hash.is_none(),
+            "a locally enrolled server holds the key itself"
+        );
     }
 
     #[test]

@@ -113,7 +113,20 @@ mod tests {
 
     #[test]
     fn varint_roundtrips_across_every_width() {
-        for v in [0, 1, 0x7f, 0x80, 0x3fff, 0x4000, 0x1fffff, 0x200000, 0xfffffff, 0x10000000, 0xffffffff, 0x1_0000_0000] {
+        for v in [
+            0,
+            1,
+            0x7f,
+            0x80,
+            0x3fff,
+            0x4000,
+            0x1fffff,
+            0x200000,
+            0xfffffff,
+            0x10000000,
+            0xffffffff,
+            0x1_0000_0000,
+        ] {
             roundtrip(v);
         }
     }
