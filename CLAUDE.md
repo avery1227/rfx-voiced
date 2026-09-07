@@ -33,6 +33,11 @@ restart that changed nothing looked identical to a successful update.
 Reinstall is safe here: the install script writes only the binary and never
 touches `servers.json`, the cache, or anything else in the volume.
 
+**Push main first, wait for CI, then tag.** Pushing both at once starts CI and
+Release on the same commit at the same time, which builds the image twice and -
+worse - tags a commit before anything has validated it. That is exactly how
+v0.1.0 shipped broken.
+
 `git push origin main` alone ships nothing. Tags are what CI releases from,
 and the release job checks out **the tag** — so a fix on `main` that isn't
 tagged rebuilds nothing. A tag pointing at a broken commit rebuilds the broken

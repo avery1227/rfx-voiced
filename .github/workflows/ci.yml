@@ -11,6 +11,14 @@ env:
   # A failed build should say why, not print a wall of backtrace-less panics.
   RUST_BACKTRACE: 1
 
+# One run per ref. A quick follow-up push should cancel the run it supersedes
+# rather than queue behind it - the older result is about to be irrelevant.
+# Releases are never cancelled: a half-pushed set of image tags is worse than
+# a slow one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
