@@ -16,6 +16,12 @@
 
 set -e
 
+# Printed first, so the log says which script ran. Two reinstalls were spent
+# debugging a script that was not the one being edited: the panel keeps the
+# install script on the EGG, and a server attached to a different (or
+# duplicated) egg silently runs the old one while reporting success.
+echo "=== rfx-voiced install script r3 (release mode) ==="
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl jq git
