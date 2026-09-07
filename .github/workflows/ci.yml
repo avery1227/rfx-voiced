@@ -3,6 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+    # Documentation cannot break a build, and running one to find that out
+    # burns several minutes per prose edit. Release is unaffected - a tag
+    # always builds, whatever it touches.
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.gitattributes'
   pull_request:
   workflow_dispatch:
 
