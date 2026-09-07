@@ -97,10 +97,23 @@ async fn handle(
 
     let mut parts = request_line.split_whitespace();
     let _method = parts.next().unwrap_or("");
+    // The LAST path segment is the message name, not the whole path.
+    //
+    // Message names are single words - route, unkey, resync - so anything to
+    // the left of the final slash is a proxy's doing. Cloudflare Tunnel path
+    // rules forward the prefix rather than stripping it (unlike Caddy's
+    // handle_path), so a node behind one at /control/* would otherwise see
+    // "control/route" and match nothing. Being indifferent to the prefix means
+    // the node works behind any proxy layout without a config option for it.
     let path = parts
         .next()
         .unwrap_or("/")
-        .trim_start_matches('/')
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
         .to_string();
 
     let payload: Value = if body.is_empty() {

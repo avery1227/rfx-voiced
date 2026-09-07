@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -150,9 +151,34 @@ pub async fn serve(addr: String, streams: SharedStreams) -> Result<()> {
             println!("stream: {client} connected from {peer}");
 
             let writer = tokio::spawn(async move {
-                while let Some(frame) = rx.recv().await {
-                    if tx_ws.send(Message::Binary(frame.into())).await.is_err() {
-                        break;
+                // A radio channel is silent most of the time, and this socket
+                // sends nothing while it is. Every proxy between here and the
+                // player treats a silent connection as a dead one: Cloudflare
+                // closes an idle WebSocket at around 100 seconds, and consumer
+                // NAT tables drop idle flows sooner than that.
+                //
+                // Without this the failure is nastily specific - everything
+                // works while somebody is talking, and listeners silently drop
+                // during exactly the quiet spells that precede the traffic they
+                // are waiting for.
+                let mut ping = tokio::time::interval(Duration::from_secs(25));
+                ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+                loop {
+                    tokio::select! {
+                        frame = rx.recv() => match frame {
+                            Some(frame) => {
+                                if tx_ws.send(Message::Binary(frame.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        },
+                        _ = ping.tick() => {
+                            if tx_ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             });

@@ -1,0 +1,43 @@
+# Cloudflare Tunnel config for a voice node.
+#
+#   /etc/cloudflared/config.yml, with cloudflared running as a systemd service
+#   on the HOST - not inside Pelican. Pelican runs one process per server, and
+#   the tunnel is host infrastructure rather than a game server.
+#
+# Setup:
+#   cloudflared tunnel login
+#   cloudflared tunnel create voice-nyc
+#   cloudflared tunnel route dns voice-nyc nyc-voice.interophq.com
+#   cloudflared service install
+#
+# No inbound ports are opened. cloudflared connects out, so the node's two
+# listeners can stay bound to 127.0.0.1 and the host can drop all inbound.
+
+tunnel: voice-nyc
+credentials-file: /etc/cloudflared/voice-nyc.json
+
+ingress:
+  # Order matters - first match wins, and the catch-all must be last.
+  #
+  # cloudflared does NOT strip the matched prefix (Caddy's handle_path does).
+  # The node takes the LAST path segment as the message name for exactly this
+  # reason, so /control/route arrives and resolves to "route" unchanged.
+  - hostname: nyc-voice.interophq.com
+    path: ^/control/.*
+    service: http://localhost:8787
+
+  # ws:// not http://. cloudflared will upgrade either way, but naming the
+  # scheme means a misconfiguration fails at start rather than at the first
+  # player who tries to listen.
+  - hostname: nyc-voice.interophq.com
+    path: ^/stream.*
+    service: ws://localhost:8788
+    originRequest:
+      # The stream is silent between transmissions. The node pings every 25s
+      # to hold the socket open through Cloudflare's ~100s idle close; this
+      # keeps the origin side from giving up first.
+      connectTimeout: 10s
+      tcpKeepAlive: 30s
+      noHappyEyeballs: false
+
+  - service: http_status:404
