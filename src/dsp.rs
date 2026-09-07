@@ -22,7 +22,8 @@
 //! listeners are grouped to the nearest `LANE_STEP` and each group shares one
 //! Codec2 decoder. Forty listeners cost a handful of decodes, not forty.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use anyhow::Result;
 use codec2::{Codec2, Codec2Mode};
@@ -795,5 +796,282 @@ mod tests {
             "quality 30 must not sound identical to quality 100"
         );
         Ok(())
+    }
+}
+
+// -- AM ---------------------------------------------------------------------
+
+/// Samples in one 20 ms frame at 8 kHz. The vocoder's natural unit.
+const AM_FRAME: usize = 160;
+
+/// A talker is treated as gone once its queue has been dry this long. Without
+/// it, one radio unkeying would stall everybody else waiting for samples that
+/// are never coming.
+const AM_GONE_MS: u64 = 120;
+
+/// Mixes concurrent transmissions on one AM frequency.
+///
+/// FM captures and AM does not: on airband both carriers reach the receiver,
+/// the envelope detector sums them, and their carriers - never exactly on
+/// frequency - beat together into a heterodyne squeal at the difference. The
+/// result is two voices and a whistle, none of it intelligible.
+///
+/// This has to happen HERE rather than at each client. The frames of two
+/// talkers arriving at one listener would otherwise interleave into alternating
+/// chunks of each, which sounds like neither. Mixing at the node also means
+/// every receiver hears the same collision, which is what a shared frequency
+/// means.
+#[derive(Default)]
+pub struct AmMix {
+    /// Pending samples per (lane, talker). Lanes are kept apart because a
+    /// listener on a bad link and one on a good link are hearing different
+    /// renderings of the same collision.
+    queues: HashMap<(u8, u32), VecDeque<i16>>,
+    /// When each talker last contributed anything.
+    seen: HashMap<u32, Instant>,
+    phase: f32,
+}
+
+impl AmMix {
+    pub fn add(&mut self, lane: u8, talker: u32, pcm: &[i16], now: Instant) {
+        self.seen.insert(talker, now);
+        self.queues
+            .entry((lane, talker))
+            .or_default()
+            .extend(pcm.iter().copied());
+    }
+
+    /// Everything still queued, whether or not every talker has contributed.
+    ///
+    /// For the moment a collision ends. The frames still held belong to
+    /// whoever is left, and discarding them clips their first word after the
+    /// other radio let go - which is exactly the word somebody was straining
+    /// to hear through the mess.
+    pub fn flush(&mut self) -> Vec<(u8, Vec<i16>)> {
+        let mut lanes: Vec<u8> = self.queues.keys().map(|(lane, _)| *lane).collect();
+        lanes.sort_unstable();
+        lanes.dedup();
+
+        let mut out: Vec<(u8, Vec<i16>)> = Vec::new();
+        for lane in lanes {
+            let talkers: Vec<u32> = self
+                .queues
+                .keys()
+                .filter(|(l, _)| *l == lane)
+                .map(|(_, t)| *t)
+                .collect();
+
+            let longest = talkers
+                .iter()
+                .filter_map(|t| self.queues.get(&(lane, *t)).map(|q| q.len()))
+                .max()
+                .unwrap_or(0);
+
+            let mut pcm: Vec<i16> = Vec::with_capacity(longest);
+            for _ in 0..longest {
+                let mut sum: i32 = 0;
+                for t in &talkers {
+                    if let Some(q) = self.queues.get_mut(&(lane, *t)) {
+                        sum += i32::from(q.pop_front().unwrap_or(0));
+                    }
+                }
+                // No heterodyne: the collision is over by the time this runs.
+                pcm.push(sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+            }
+
+            if !pcm.is_empty() {
+                out.push((lane, pcm));
+            }
+        }
+
+        self.queues.clear();
+        self.seen.clear();
+        out
+    }
+
+    /// Whole frames that every present talker has contributed to.
+    ///
+    /// Self-clocking off whoever is transmitting: a frame comes out as soon as
+    /// the last contributor supplies its share, so the mix drifts by at most
+    /// one frame behind the slowest radio.
+    pub fn drain(&mut self, now: Instant) -> Vec<(u8, Vec<i16>)> {
+        // Whoever has stopped is no longer waited for.
+        self.seen
+            .retain(|_, at| now.duration_since(*at).as_millis() as u64 <= AM_GONE_MS);
+        self.queues.retain(|(_, t), _| self.seen.contains_key(t));
+
+        let lanes: Vec<u8> = {
+            let mut v: Vec<u8> = self.queues.keys().map(|(lane, _)| *lane).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+
+        let mut out: Vec<(u8, Vec<i16>)> = Vec::new();
+
+        for lane in lanes {
+            let talkers: Vec<u32> = self
+                .queues
+                .keys()
+                .filter(|(l, _)| *l == lane)
+                .map(|(_, t)| *t)
+                .collect();
+
+            let mut pcm: Vec<i16> = Vec::new();
+            loop {
+                let ready = talkers.iter().all(|t| {
+                    self.queues
+                        .get(&(lane, *t))
+                        .is_some_and(|q| q.len() >= AM_FRAME)
+                });
+                if !ready {
+                    break;
+                }
+
+                for _ in 0..AM_FRAME {
+                    let mut sum: i32 = 0;
+                    for t in &talkers {
+                        if let Some(q) = self.queues.get_mut(&(lane, *t)) {
+                            sum += i32::from(q.pop_front().unwrap_or(0));
+                        }
+                    }
+
+                    // The heterodyne. Two carriers a few hundred hertz apart,
+                    // which is what makes a collision on AM recognisable as
+                    // one rather than as somebody with a bad microphone. Only
+                    // present while more than one radio is up.
+                    if talkers.len() > 1 {
+                        self.phase += std::f32::consts::TAU * AM_BEAT_HZ / RATE as f32;
+                        if self.phase > std::f32::consts::TAU {
+                            self.phase -= std::f32::consts::TAU;
+                        }
+                        sum += (self.phase.sin() * 2200.0) as i32;
+                    }
+
+                    pcm.push(sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+                }
+            }
+
+            if !pcm.is_empty() {
+                out.push((lane, pcm));
+            }
+        }
+
+        out
+    }
+}
+
+/// The beat note. Real carriers are never exactly co-channel, and a few
+/// hundred hertz is both typical and firmly in the range that ruins speech.
+const AM_BEAT_HZ: f32 = 620.0;
+
+#[cfg(test)]
+mod am_tests {
+    use super::*;
+
+    fn tone(n: usize, v: i16) -> Vec<i16> {
+        vec![v; n]
+    }
+
+    #[test]
+    fn one_talker_alone_is_held_until_the_frame_is_whole() {
+        let mut mix = AmMix::default();
+        let now = Instant::now();
+
+        mix.add(0, 1, &tone(80, 100), now);
+        assert!(mix.drain(now).is_empty(), "half a frame is not a frame");
+
+        mix.add(0, 1, &tone(80, 100), now);
+        let out = mix.drain(now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.len(), AM_FRAME);
+    }
+
+    #[test]
+    fn two_talkers_are_summed_not_interleaved() {
+        let mut mix = AmMix::default();
+        let now = Instant::now();
+
+        // The mixer only learns a talker exists when they contribute, so the
+        // first frame of a collision goes out on its own. One frame - 20 ms -
+        // and it is what actually happens anyway: the second radio keyed a
+        // moment after the first.
+        mix.add(0, 1, &tone(AM_FRAME, 1000), now);
+        assert_eq!(mix.drain(now).len(), 1);
+
+        // From here both are known, and neither is emitted alone.
+        mix.add(0, 2, &tone(AM_FRAME, 2000), now);
+        assert!(
+            mix.drain(now).is_empty(),
+            "the other radio has not supplied its share yet, and emitting this              frame now would be interleaving rather than mixing"
+        );
+
+        mix.add(0, 1, &tone(AM_FRAME, 1000), now);
+        let out = mix.drain(now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.len(), AM_FRAME);
+
+        // 1000 + 2000. Averaged across the frame, because the heterodyne
+        // rides on top at a couple of thousand counts either way - which is
+        // the point of it - and integrates to nothing over a dozen cycles.
+        let mean: i32 = out[0].1.iter().map(|s| i32::from(*s)).sum::<i32>() / AM_FRAME as i32;
+        assert!(
+            (2600..=3400).contains(&mean),
+            "summed, not captured: mean {mean}"
+        );
+
+        // And the beat is actually present, or this is only addition.
+        let peak = out[0].1.iter().map(|s| i32::from(*s)).max().unwrap();
+        assert!(peak > 4000, "no heterodyne: peak {peak}");
+    }
+
+    #[test]
+    fn lanes_stay_apart() {
+        let mut mix = AmMix::default();
+        let now = Instant::now();
+
+        for lane in [0u8, 2] {
+            mix.add(lane, 1, &tone(AM_FRAME, 500), now);
+            mix.add(lane, 2, &tone(AM_FRAME, 500), now);
+        }
+
+        let out = mix.drain(now);
+        assert_eq!(
+            out.len(),
+            2,
+            "a bad link and a good one are different mixes"
+        );
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[1].0, 2);
+    }
+
+    #[test]
+    fn a_talker_who_stopped_is_not_waited_for_forever() {
+        let mut mix = AmMix::default();
+        let start = Instant::now();
+
+        mix.add(0, 1, &tone(AM_FRAME, 1000), start);
+        mix.add(0, 2, &tone(AM_FRAME * 2, 1000), start);
+        assert_eq!(mix.drain(start).len(), 1);
+
+        // Talker 1 let go. Talker 2 must not be stuck holding a frame waiting
+        // for samples that are never coming.
+        let later = start + std::time::Duration::from_millis(AM_GONE_MS + 20);
+        mix.add(0, 2, &tone(AM_FRAME, 1000), later);
+        let out = mix.drain(later);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.len() >= AM_FRAME);
+    }
+
+    #[test]
+    fn flush_does_not_clip_whoever_is_left() {
+        let mut mix = AmMix::default();
+        let now = Instant::now();
+
+        mix.add(0, 1, &tone(90, 1000), now);
+        let out = mix.flush();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.len(), 90, "a partial frame still gets heard");
+        assert!(mix.flush().is_empty());
     }
 }

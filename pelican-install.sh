@@ -20,7 +20,7 @@ set -e
 # debugging a script that was not the one being edited: the panel keeps the
 # install script on the EGG, and a server attached to a different (or
 # duplicated) egg silently runs the old one while reporting success.
-echo "=== rfx-voiced install script r3 (release mode) ==="
+echo "=== rfx-voiced install script r4 (release mode) ==="
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -28,6 +28,11 @@ apt-get install -y --no-install-recommends ca-certificates curl jq git
 
 mkdir -p /mnt/server
 cd /mnt/server
+
+# The recorder writes here. Created now rather than on first call so a
+# permissions problem surfaces during install, where somebody is watching,
+# instead of silently disabling recording weeks later.
+mkdir -p /mnt/server/recordings
 
 export HOME=/mnt/server
 export CARGO_HOME=/mnt/server/.cargo

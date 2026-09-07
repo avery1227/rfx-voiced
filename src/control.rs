@@ -41,6 +41,7 @@ pub async fn serve(
     streams: SharedStreams,
     keys: SharedKeys,
     node_key: Option<String>,
+    recorder: crate::recorder::SharedRecorder,
 ) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("control api listening on {addr}");
@@ -51,8 +52,9 @@ pub async fn serve(
         let streams = streams.clone();
         let keys = keys.clone();
         let node_key = node_key.clone();
+        let recorder = recorder.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(socket, router, streams, keys, node_key).await {
+            if let Err(e) = handle(socket, router, streams, keys, node_key, recorder).await {
                 eprintln!("control: {e}");
             }
         });
@@ -65,6 +67,7 @@ async fn handle(
     streams: SharedStreams,
     keys: SharedKeys,
     node_key: Option<String>,
+    recorder: crate::recorder::SharedRecorder,
 ) -> Result<()> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
@@ -171,7 +174,7 @@ async fn handle(
             )
             .await;
         }
-        let (code, reply) = dispatch_console(&path, &payload, &router, &streams);
+        let (code, reply) = dispatch_console(&path, &payload, &router, &streams, &recorder);
         return respond(&mut socket, code, &reply).await;
     }
 
@@ -186,7 +189,7 @@ async fn handle(
         .await;
     };
 
-    let (code, reply) = dispatch(&path, &payload, server, &router, &streams);
+    let (code, reply) = dispatch(&path, &payload, server, &router, &streams, &recorder);
     respond(&mut socket, code, &reply).await
 }
 
@@ -196,6 +199,7 @@ fn dispatch_console(
     body: &Value,
     router: &Shared,
     streams: &SharedStreams,
+    recorder: &crate::recorder::SharedRecorder,
 ) -> (u16, Value) {
     let tgs: Vec<u32> = body
         .get("talkgroups")
@@ -218,6 +222,46 @@ fn dispatch_console(
     };
 
     match path {
+        // The recorder's index and one call's audio. Node-key authenticated
+        // like the rest of the console plane - a browser never reaches this
+        // directly, the platform proxies for it.
+        "rec.index" => {
+            let since = body.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
+            let limit = body
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(200)
+                .min(1000) as usize;
+
+            let calls = match recorder.lock() {
+                Ok(r) => r
+                    .rec
+                    .as_ref()
+                    .map(|x| x.index(since, limit))
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            (200, json!({ "ok": true, "calls": calls }))
+        }
+
+        "rec.audio" => {
+            let id = body.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let pcm = match recorder.lock() {
+                Ok(r) => r.rec.as_ref().and_then(|x| x.audio(id)),
+                Err(_) => None,
+            };
+            match pcm {
+                // Base64 rather than a binary body: this rides the same small
+                // hand-rolled HTTP as the rest of the control API, and a call
+                // is a few hundred kilobytes at most.
+                Some(bytes) => (
+                    200,
+                    json!({ "ok": true, "rate": crate::dsp::RATE, "pcm": b64(&bytes) }),
+                ),
+                None => (404, json!({ "ok": false, "error": "no such recording" })),
+            }
+        }
+
         "console.attach" => {
             let id = NEXT_CONSOLE.fetch_add(1, Ordering::Relaxed);
             let client = ClientId::new(CONSOLE_SERVER, id);
@@ -296,6 +340,33 @@ fn announce_call(r: &Router, streams: &SharedStreams, tg: u32, keyed: bool, talk
     }
 }
 
+/// Base64. A dependency for eighteen lines would be the wrong trade.
+fn b64(data: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        out.push(A[(n >> 18 & 63) as usize] as char);
+        out.push(A[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            A[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn u32_of(v: &Value, key: &str) -> Option<u32> {
     v.get(key).and_then(|x| x.as_u64()).map(|x| x as u32)
 }
@@ -313,6 +384,7 @@ fn dispatch(
     server: u32,
     router: &Shared,
     streams: &SharedStreams,
+    recorder: &crate::recorder::SharedRecorder,
 ) -> (u16, Value) {
     let mut r = match router.lock() {
         Ok(g) => g,
@@ -325,9 +397,12 @@ fn dispatch(
         // about what keying means.
         "conv.open" => match u32_of(body, "tg") {
             Some(id) => {
-                let fresh = r.open_conventional(id);
+                // Airband. The FXServer says so, because it is the thing
+                // holding the codeplug that knows this channel is AM.
+                let am = body.get("am").and_then(|v| v.as_bool()).unwrap_or(false);
+                let fresh = r.open_conventional(id, am);
                 if fresh {
-                    println!("CONV OPEN     {id}");
+                    println!("CONV OPEN     {id}{}", if am { " AM" } else { "" });
                 }
                 (200, json!({ "ok": true, "fresh": fresh }))
             }
@@ -381,6 +456,15 @@ fn dispatch(
 
         "key" => match (u32_of(body, "tg"), client_of(server, body)) {
             (Some(tg), Some(client)) => match r.key(tg, client) {
+                Ok(crate::router::Keyed::Mixed) => {
+                    // AM. Accepted AND heard, on top of whoever was already
+                    // there. No announcement and no recording: the call that
+                    // is open on this frequency is still theirs, and this
+                    // audio joins it rather than starting another.
+                    println!("MIXED        tg {tg} <- {client}");
+                    (200, json!({ "ok": true, "mixed": true }))
+                }
+
                 Ok(crate::router::Keyed::Doubled) => {
                     // Somebody else already holds this frequency. Accepted -
                     // conventional has nothing to refuse with - but not heard,
@@ -403,6 +487,10 @@ fn dispatch(
                         })
                         .unwrap_or_default();
                     announce_call(&r, streams, tg, true, &unit);
+
+                    if let Ok(mut rec) = recorder.lock() {
+                        rec.begin(tg, server, client.player, &unit, crate::dsp::RATE);
+                    }
 
                     let bound = r.session_of(client).is_some();
                     println!(
@@ -432,6 +520,9 @@ fn dispatch(
         "unkey" => match u32_of(body, "tg") {
             Some(tg) => {
                 announce_call(&r, streams, tg, false, "");
+                if let Ok(mut rec) = recorder.lock() {
+                    rec.end(tg);
+                }
                 // Scoped to the caller when it names one: dispatch can preempt a
                 // unit, and the preempted unit still sends its own unkey.
                 match client_of(server, body) {

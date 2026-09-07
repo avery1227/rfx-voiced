@@ -75,6 +75,21 @@ pub struct Route {
     pub keyed: Option<ClientId>,
     /// A frequency rather than a talkgroup. Changes what keying means.
     pub conventional: bool,
+    /// Amplitude modulation, which changes what a collision SOUNDS like.
+    ///
+    /// FM captures: the stronger signal wins outright and the weaker is not
+    /// heard at all. AM does not capture. Both transmitters reach the
+    /// receiver, the detector sums them, and their carriers beat together into
+    /// a heterodyne whistle. Both voices are present and neither is
+    /// intelligible - which is exactly why airband still trains people not to
+    /// step on each other, and why modelling it as capture would teach the
+    /// wrong lesson.
+    pub am: bool,
+    /// Everybody else transmitting on this frequency right now.
+    ///
+    /// Only ever populated on an AM route. Everywhere else a route has exactly
+    /// one holder by construction, and this stays empty.
+    pub also: Vec<ClientId>,
 }
 
 /// What happened to a key request. Preemption carries whoever was cut off, so
@@ -88,6 +103,10 @@ pub enum Keyed {
     /// over the stronger signal. There is no bonk on conventional because
     /// there is nothing to bonk you - no controller, no grant, nobody asked.
     Doubled,
+
+    /// Accepted on an AM channel somebody else is already on. Both are heard,
+    /// summed and beating, and both are hard to make out.
+    Mixed,
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +121,11 @@ pub struct Router {
     client_to_session: HashMap<ClientId, SessionId>,
     /// Talkgroups cross-connected into one. Audio on any member goes out on
     /// all of them, and keying any of them takes all of them.
+    /// The route each speaker KEYED, as opposed to every route that key took.
+    /// A patch keys its whole group, so `keyed` alone cannot say which
+    /// talkgroup the transmission is on - and that is what gets announced to
+    /// consoles and written into the recording.
+    keyed_by: HashMap<ClientId, u32>,
     patches: Vec<Vec<u32>>,
 }
 
@@ -170,10 +194,11 @@ impl Router {
     /// transmit, and what a listener hears is decided by physics rather than
     /// by a system - which is the whole reason trunking was invented, and the
     /// clearest possible demonstration of it to somebody holding a radio.
-    pub fn open_conventional(&mut self, id: u32) -> bool {
+    pub fn open_conventional(&mut self, id: u32, am: bool) -> bool {
         let fresh = !self.routes.contains_key(&id);
         let route = self.routes.entry(id).or_default();
         route.conventional = true;
+        route.am = am;
         fresh
     }
 
@@ -205,10 +230,13 @@ impl Router {
                 // outcome that matters.
                 let _ = self.key_one(other, client);
             }
+            self.keyed_by.insert(client, tg);
             return Ok(outcome);
         }
 
-        self.key_one(tg, client)
+        let outcome = self.key_one(tg, client)?;
+        self.keyed_by.insert(client, tg);
+        Ok(outcome)
     }
 
     fn key_one(&mut self, tg: u32, client: ClientId) -> Result<Keyed, &'static str> {
@@ -227,6 +255,16 @@ impl Router {
             //
             // Notably it is NOT refused. A conventional radio has nothing to
             // refuse it with.
+            // AM does not capture, so a second transmitter is not merely
+            // tolerated - it is HEARD, on top of the first. Recording it here
+            // is what lets the mixer find it.
+            Some(_) if route.conventional && route.am => {
+                if !route.also.contains(&client) {
+                    route.also.push(client);
+                }
+                Ok(Keyed::Mixed)
+            }
+
             Some(_) if route.conventional => Ok(Keyed::Doubled),
 
             Some(holder) => {
@@ -266,9 +304,11 @@ impl Router {
     pub fn forget_client(&mut self, client: ClientId) {
         for route in self.routes.values_mut() {
             route.members.remove(&client);
+            route.also.retain(|&c| c != client);
             if route.keyed == Some(client) {
                 route.keyed = None;
             }
+            self.keyed_by.remove(&client);
         }
     }
 
@@ -280,12 +320,41 @@ impl Router {
     /// to; the client saying so in a frame would let a position transmit on a
     /// talkgroup it never asked for and was never granted.
     pub fn destination_of(&self, speaker: ClientId) -> Option<(u32, Vec<(ClientId, u8)>)> {
-        for (&tg, route) in &self.routes {
-            if route.keyed == Some(speaker) {
-                return Some((tg, self.listeners_across(tg, Some(speaker))));
-            }
-        }
-        None
+        // Prefer the route they asked for. Scanning for a holder finds any
+        // member of a patch group, and `routes` is a HashMap - so which member
+        // it found changed between runs, and with it the talkgroup announced
+        // to consoles and written into the recording.
+        let tg = match self.keyed_by.get(&speaker) {
+            Some(&tg) if self.holds(tg, speaker) => tg,
+            // Preempted off their own route, or holding one they did not key.
+            // Lowest id, so it is at least stable.
+            _ => self
+                .routes
+                .keys()
+                .copied()
+                .filter(|&tg| self.holds(tg, speaker))
+                .min()?,
+        };
+        Some((tg, self.listeners_across(tg, Some(speaker))))
+    }
+
+    /// Whether this client is transmitting on that route right now - as the
+    /// holder, or as somebody mixed in on top of them.
+    fn holds(&self, tg: u32, client: ClientId) -> bool {
+        self.routes
+            .get(&tg)
+            .is_some_and(|r| r.keyed == Some(client) || r.also.contains(&client))
+    }
+
+    /// Everybody transmitting on a route at once. One person normally; more
+    /// only on AM, where that is the whole point.
+    pub fn talkers_on(&self, tg: u32) -> Vec<ClientId> {
+        let Some(route) = self.routes.get(&tg) else {
+            return Vec::new();
+        };
+        let mut out: Vec<ClientId> = route.keyed.into_iter().collect();
+        out.extend(route.also.iter().copied());
+        out
     }
 
     /// Listeners on a talkgroup and everything patched to it.
@@ -339,12 +408,17 @@ impl Router {
         let mut released = false;
         for other in self.joined(tg) {
             if let Some(route) = self.routes.get_mut(&other) {
+                if route.also.contains(&client) {
+                    route.also.retain(|&c| c != client);
+                    released = true;
+                }
                 if route.keyed == Some(client) {
                     route.keyed = None;
                     released = true;
                 }
             }
         }
+        self.keyed_by.remove(&client);
         released
     }
 
@@ -352,6 +426,7 @@ impl Router {
     pub fn unkey(&mut self, tg: u32) {
         if let Some(route) = self.routes.get_mut(&tg) {
             route.keyed = None;
+            route.also.clear();
         }
     }
 
@@ -652,6 +727,53 @@ mod tests {
         let unit = ClientId::new(1, 7);
         assert_eq!(r.key(1001, unit), Ok(Keyed::Granted));
         assert_eq!(r.key(1001, unit), Ok(Keyed::Granted));
+    }
+
+    // -- Conventional, and what a collision sounds like ---------------------
+
+    #[test]
+    fn fm_captures_so_the_second_radio_is_not_heard() {
+        let mut r = Router::default();
+        r.open_conventional(0x8000_1234, false);
+        let (a, b) = (ClientId::new(1, 1), ClientId::new(1, 2));
+
+        assert_eq!(r.key(0x8000_1234, a), Ok(Keyed::Granted));
+        // Accepted - a conventional channel has nothing to refuse it with -
+        // but routed nowhere, which is what capture means.
+        assert_eq!(r.key(0x8000_1234, b), Ok(Keyed::Doubled));
+        assert!(r.destination_of(b).is_none());
+    }
+
+    #[test]
+    fn am_does_not_capture_so_both_are_heard() {
+        let mut r = Router::default();
+        r.open_conventional(0x8000_1234, true);
+        let (a, b) = (ClientId::new(1, 1), ClientId::new(1, 2));
+        r.set_member(0x8000_1234, ClientId::new(1, 9), true, 100);
+
+        assert_eq!(r.key(0x8000_1234, a), Ok(Keyed::Granted));
+        assert_eq!(r.key(0x8000_1234, b), Ok(Keyed::Mixed));
+
+        for who in [a, b] {
+            let (tg, listeners) = r.destination_of(who).expect("both reach the frequency");
+            assert_eq!(tg, 0x8000_1234);
+            assert!(listeners.iter().any(|(c, _)| *c == ClientId::new(1, 9)));
+        }
+        assert_eq!(r.talkers_on(0x8000_1234).len(), 2);
+    }
+
+    #[test]
+    fn one_am_radio_unkeying_leaves_the_other_up() {
+        let mut r = Router::default();
+        r.open_conventional(0x8000_1234, true);
+        let (a, b) = (ClientId::new(1, 1), ClientId::new(1, 2));
+        r.key(0x8000_1234, a).unwrap();
+        r.key(0x8000_1234, b).unwrap();
+
+        assert!(r.unkey_as(0x8000_1234, b));
+        assert_eq!(r.talkers_on(0x8000_1234), vec![a]);
+        assert!(r.destination_of(a).is_some());
+        assert!(r.destination_of(b).is_none());
     }
 
     // -- Patches ------------------------------------------------------------

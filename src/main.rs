@@ -28,6 +28,7 @@ mod control;
 mod dsp;
 mod mumble;
 mod platform;
+mod recorder;
 mod router;
 mod servers;
 mod stream;
@@ -199,6 +200,30 @@ async fn main() -> Result<()> {
     // has to be reachable from outside the host.
     let stream_addr = env_or("VOICED_STREAM", "0.0.0.0:8788");
 
+    // Recording is off unless VOICED_RECORD_DIR is set, which is a supported
+    // way to run - not every deployment wants thirty days of voice on disk.
+    let recorder: recorder::SharedRecorder = Arc::new(Mutex::new(recorder::Active {
+        rec: recorder::Recorder::from_env(),
+        ..Default::default()
+    }));
+
+    {
+        // Retention on a timer as well as at startup: a node left running for
+        // months would otherwise only ever prune the day it booted.
+        let recorder = recorder.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                if let Ok(r) = recorder.lock() {
+                    if let Some(rec) = r.rec.as_ref() {
+                        rec.prune();
+                    }
+                }
+            }
+        });
+    }
+
     let shared: control::Shared = Arc::new(Mutex::new(router::Router::default()));
     if let Ok(mut r) = shared.lock() {
         r.set_patches(patches);
@@ -209,8 +234,11 @@ async fn main() -> Result<()> {
         let shared = shared.clone();
         let streams = streams.clone();
         let keys = keys.clone();
+        let recorder = recorder.clone();
         tokio::spawn(async move {
-            if let Err(e) = control::serve(control_addr, shared, streams, keys, node_key).await {
+            if let Err(e) =
+                control::serve(control_addr, shared, streams, keys, node_key, recorder).await
+            {
                 eprintln!("control api stopped: {e}");
             }
         });
@@ -366,6 +394,7 @@ async fn main() -> Result<()> {
                     };
                     let shared = shared.clone();
                     let streams = streams.clone();
+                    let recorder = recorder.clone();
 
                     let handle = tokio::spawn(async move {
                         // Each tap reconnects on its own. One FXServer
@@ -373,7 +402,14 @@ async fn main() -> Result<()> {
                         // target host nobody is watching to restart this by
                         // hand.
                         loop {
-                            match mumble::run(&settings, shared.clone(), streams.clone()).await {
+                            match mumble::run(
+                                &settings,
+                                shared.clone(),
+                                streams.clone(),
+                                recorder.clone(),
+                            )
+                            .await
+                            {
                                 Ok(()) => {
                                     println!("[server {}] tap closed cleanly", settings.server)
                                 }

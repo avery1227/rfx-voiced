@@ -202,7 +202,12 @@ pub fn install_crypto_provider() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))
 }
 
-pub async fn run(cfg: &Settings, router: Shared, streams: SharedStreams) -> Result<()> {
+pub async fn run(
+    cfg: &Settings,
+    router: Shared,
+    streams: SharedStreams,
+    recorder: crate::recorder::SharedRecorder,
+) -> Result<()> {
     let tls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
@@ -294,6 +299,9 @@ pub async fn run(cfg: &Settings, router: Shared, streams: SharedStreams) -> Resu
     // One vocoder chain per talker, created on first audio and dropped when
     // they leave. Codec2 state is per-stream, so it cannot be shared.
     let mut talkers: HashMap<u32, dsp::Talker> = HashMap::new();
+
+    // One mixer per AM frequency, alive only while people are colliding on it.
+    let mut ammix: HashMap<u32, dsp::AmMix> = HashMap::new();
     let mut me: Option<u32> = None;
 
     // CHANNEL LISTENING - how the tap hears everyone.
@@ -404,9 +412,60 @@ pub async fn run(cfg: &Settings, router: Shared, streams: SharedStreams) -> Resu
 
                                             match talker.push(payload, &qualities) {
                                                 Ok(lanes) => {
-                                                    if let Ok(mut s) = streams.lock() {
+                                                    // AM does not capture, so more
+                                                    // than one radio can be up on
+                                                    // this frequency at once. What a
+                                                    // listener hears then is the sum,
+                                                    // and it has to be summed here -
+                                                    // two talkers' frames arriving at
+                                                    // one client would interleave into
+                                                    // alternating chunks of each.
+                                                    let colliding = router
+                                                        .lock()
+                                                        .ok()
+                                                        .map(|r| r.talkers_on(tg).len())
+                                                        .unwrap_or(1)
+                                                        > 1;
+
+                                                    let out = if colliding {
+                                                        let mix = ammix.entry(tg).or_default();
                                                         for (lane, pcm) in &lanes {
-                                                            if pcm.is_empty() { continue; }
+                                                            mix.add(*lane, v.session, pcm, now);
+                                                        }
+                                                        mix.drain(now)
+                                                    } else {
+                                                        // A collision that just ended:
+                                                        // what is still queued belongs to
+                                                        // whoever is left.
+                                                        match ammix.remove(&tg) {
+                                                            Some(mut mix) => {
+                                                                let mut out = mix.flush();
+                                                                out.extend(lanes);
+                                                                out
+                                                            }
+                                                            None => lanes,
+                                                        }
+                                                    };
+
+                                                    // Record the CLEANEST lane that
+                                                    // exists. What is kept should be
+                                                    // the call, not one listener's bad
+                                                    // reception of it - a recording
+                                                    // nobody can make out is not
+                                                    // evidence of anything.
+                                                    if let Some((_, best)) =
+                                                        out.iter().min_by_key(|(lane, _)| *lane)
+                                                    {
+                                                        if let Ok(mut r) = recorder.lock() {
+                                                            r.push(tg, best);
+                                                        }
+                                                    }
+
+                                                    if let Ok(mut s) = streams.lock() {
+                                                        for (lane, pcm) in &out {
+                                                            if pcm.is_empty() {
+                                                                continue;
+                                                            }
                                                             for (client, q) in &listeners {
                                                                 if dsp::lane_of(*q) == *lane {
                                                                     s.send_pcm(*client, tg, pcm);
