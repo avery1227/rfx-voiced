@@ -98,6 +98,26 @@ install and the startup command runs the binary, rather than recompiling on
 every boot. It needs **two allocations**: the primary is the control API, and
 a second one — set in the `VOICED_STREAM_PORT` variable — is the audio stream.
 
+## Deploying an update
+
+```
+git tag -a v0.1.4 -m "what changed" && git push origin v0.1.4
+```
+
+Then in Pelican: **Settings -> Reinstall Server**.
+
+**Reinstall, not restart.** The startup command runs the binary already on
+disk and downloads nothing; only the install script fetches, and it pulls the
+latest release. A restart after tagging looks like it worked and changes
+nothing.
+
+Reinstall writes only the binary. `servers.json`, the cache and everything else
+in the volume are left alone.
+
+Pushing to `main` ships nothing on its own - the release job builds **the tag**,
+so an untagged fix rebuilds nothing and a tag on a broken commit rebuilds the
+broken commit.
+
 ## Releases
 
 Tagging `v*` builds a Linux x86_64 binary, attaches it and the Pelican egg to a
