@@ -1,0 +1,6 @@
+# Authored on Windows, run on Linux. A shell script that checks out with CRLF
+# fails as `bad interpreter: /bin/bash^M`, which is a miserable thing to debug
+# on a panel whose only output is the install log.
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile* text eol=lf

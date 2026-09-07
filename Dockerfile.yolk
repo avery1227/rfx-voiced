@@ -1,0 +1,35 @@
+# Pelican runtime image for the voice node.
+#
+# The stock Rust yolk cannot build this project: `opusic-sys` compiles libopus
+# from source with cmake, and the image ships neither cmake nor a C++ compiler.
+# A yolk runs unprivileged, so it cannot install them itself at startup - the
+# only place to fix it is the image.
+#
+# This is the stock yolk plus those two packages and nothing else, so it stays
+# in step with upstream: rebuild against a newer :rust_latest and you inherit
+# whatever they changed.
+#
+#   docker build -f Dockerfile.yolk -t ghcr.io/<you>/yolks-rust-opus:latest .
+#   docker push ghcr.io/<you>/yolks-rust-opus:latest
+#
+# Then point the Pelican egg's Docker image at that tag.
+#
+# NOTE: this image lets `cargo run --release` work as a startup command, but it
+# still recompiles on every boot - minutes of CPU on a host that is also
+# running game servers, with voice down throughout. Building once in the egg's
+# INSTALL script and starting the binary directly is the better shape; this
+# image works either way, because the install container needs cmake too.
+
+FROM ghcr.io/parkervcp/yolks:rust_latest
+
+USER root
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      cmake \
+      g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+# Back to the unprivileged user the panel expects. Everything else - entrypoint,
+# working directory, environment - is inherited unchanged.
+USER container

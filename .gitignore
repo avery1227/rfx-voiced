@@ -1,0 +1,25 @@
+# Build output. Several GB, and Cargo.lock is what makes builds reproducible.
+/target
+Cargo.zip
+
+# RUNTIME STATE, AND IT HOLDS SECRETS.
+#
+# servers.json is the local enrolment store, and an enrolled server's entry
+# contains its key in plaintext - anyone holding one can post routing as that
+# world. servers.cache.json is the last good platform response; it carries key
+# HASHES rather than keys, but it is still another server's data and it is
+# still state, not source.
+#
+# Both are written by the node next to the binary, which on Pelican is the
+# server root. Neither belongs in a repository that a game host clones.
+servers.json
+servers.cache.json
+*.cache.json
+
+# Cargo home, when CARGO_HOME points at the working directory (the Pelican
+# install script does this so the registry cache survives the container).
+/.cargo
+
+.env
+.env.*
+!.env.example

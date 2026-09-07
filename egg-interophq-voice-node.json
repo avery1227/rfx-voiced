@@ -1,0 +1,141 @@
+{
+    "_comment": "InteropHQ voice node. Built once at install; the startup command runs the binary. Needs TWO allocations: the primary is the control API (FXServer -> node) and a second is the audio stream (players' browsers -> node).",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-09-07T00:00:00+00:00",
+    "name": "InteropHQ Voice Node",
+    "author": "avery627@gmail.com",
+    "description": "rfx-voiced - the P25 voice node. Taps each FXServer's built-in Mumble server, runs the vocoder chain, and streams radio audio to game clients. Pulls its server list from InteropHQ when a platform key is set, and falls back to a local servers.json when it is not.",
+    "features": null,
+    "docker_images": {
+        "Debian 12 (bookworm)": "ghcr.io/parkervcp/yolks:debian",
+        "Rust (fallback, same base)": "ghcr.io/parkervcp/yolks:rust_latest"
+    },
+    "file_denylist": [],
+    "startup": "VOICED_CONTROL=0.0.0.0:${SERVER_PORT} VOICED_STREAM=0.0.0.0:${VOICED_STREAM_PORT} ./rfx-voiced",
+    "config": {
+        "files": "{}",
+        "startup": "{\"done\": \"server(s) from\"}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\n# InteropHQ voice node - install\n#\n# Runs as root in its own container, which is the only place the build CAN\n# happen: `opusic-sys` compiles libopus from source with cmake, and a Pelican\n# runtime yolk is unprivileged and ships neither cmake nor a C++ compiler.\n#\n# The build happens HERE, once, and the startup command just runs the binary.\n# Building at startup instead would recompile 180 crates plus libopus on every\n# restart - minutes of CPU on a box that is also running game servers, with\n# voice down the whole time.\n\nset -e\n\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y --no-install-recommends cmake git ca-certificates\n\nmkdir -p /mnt/server\ncd /mnt/server\n\n# Cargo writes to $HOME. Point both at the volume so the registry cache\n# survives the container and a reinstall is not a cold download.\nexport HOME=/mnt/server\nexport CARGO_HOME=/mnt/server/.cargo\n\nif [[ ${GIT_ADDRESS} != *.git ]]; then\n    GIT_ADDRESS=${GIT_ADDRESS}.git\nfi\n\nif [ -n \"${USERNAME}\" ] && [ -n \"${ACCESS_TOKEN}\" ]; then\n    GIT_ADDRESS=\"https://${USERNAME}:${ACCESS_TOKEN}@$(echo -e ${GIT_ADDRESS} | cut -d/ -f3-)\"\nfi\n\nBRANCH=\"${BRANCH:-main}\"\nSRC=/mnt/server/source\n\n# Source lives in its own directory rather than at the volume root. The root\n# also holds the binary, the caches and the runtime data files, and cloning\n# into it means \"is this directory empty\" can never answer the question the\n# stock installer asks it.\nif [ -d \"${SRC}/.git\" ]; then\n    echo \"updating existing checkout\"\n    cd \"${SRC}\"\n    git fetch --all --prune\n    git reset --hard \"origin/${BRANCH}\"\nelse\n    echo \"cloning ${GIT_ADDRESS} (${BRANCH})\"\n    rm -rf \"${SRC}\"\n    git clone --depth 1 --single-branch --branch \"${BRANCH}\" \"${GIT_ADDRESS}\" \"${SRC}\"\nfi\n\ncd \"${SRC}/${CRATE_DIR:-.}\"\n\nif [ ! -f Cargo.toml ]; then\n    echo \"no Cargo.toml at ${CRATE_DIR:-.} - check the CRATE_DIR variable\"\n    exit 1\nfi\n\necho \"building rfx-voiced - this is the slow part and it only happens here\"\ncargo build --release\n\ncp target/release/rfx-voiced /mnt/server/rfx-voiced\nchmod +x /mnt/server/rfx-voiced\n\n# Intermediates are several GB and count against the server's disk quota. The\n# binary is already copied out, and .cargo is kept so a rebuild is quick.\nrm -rf target\n\necho \"install complete\"\nexit 0\n",
+            "container": "rust:1-bookworm",
+            "entrypoint": "bash"
+        }
+    },
+    "variables": [
+        {
+            "name": "Git repository",
+            "description": "Repository holding the voice node source. HTTPS URL.",
+            "env_variable": "GIT_ADDRESS",
+            "default_value": "https://github.com/avery1227/rfx-voiced",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string"
+        },
+        {
+            "name": "Branch",
+            "description": "Branch to build.",
+            "env_variable": "BRANCH",
+            "default_value": "main",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string"
+        },
+        {
+            "name": "Crate directory",
+            "description": "Path to the crate inside the repository. Use . if the repo IS the crate; use resources/[local]/rfx_p25/voiced if you pushed the whole FiveM project.",
+            "env_variable": "CRATE_DIR",
+            "default_value": ".",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string"
+        },
+        {
+            "name": "Git username (private repos)",
+            "description": "Leave blank for a public repository.",
+            "env_variable": "USERNAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string"
+        },
+        {
+            "name": "Git access token (private repos)",
+            "description": "Personal access token. Leave blank for a public repository.",
+            "env_variable": "ACCESS_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": true,
+            "rules": "nullable|string"
+        },
+        {
+            "name": "Audio stream port",
+            "description": "The SECOND allocation, in Network. Players' game clients connect here for audio, so unlike the primary port this one has to be reachable from outside the host.",
+            "env_variable": "VOICED_STREAM_PORT",
+            "default_value": "8788",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|between:1,65535"
+        },
+        {
+            "name": "Platform URL",
+            "description": "InteropHQ, for the server list and heartbeat. Leave blank to run standalone from servers.json.",
+            "env_variable": "VOICED_PLATFORM_URL",
+            "default_value": "https://api.interophq.com",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string"
+        },
+        {
+            "name": "Platform node key",
+            "description": "NODE_API_KEY from the platform. This is a DIFFERENT principal from a server key - a node leaking must not be a server leaking. Watch for a trailing space; it goes inside the value and 401s.",
+            "env_variable": "VOICED_PLATFORM_KEY",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": true,
+            "rules": "nullable|string"
+        },
+        {
+            "name": "Tap username",
+            "description": "What the tap calls itself on each FXServer's Mumble server. FiveM names clients [id] name, so this must keep that shape.",
+            "env_variable": "VOICED_USER",
+            "default_value": "[999] radiotap",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string"
+        },
+        {
+            "name": "Codec2 mode",
+            "description": "3200 or 2400. 2400 is rate-matched to AMBE+2 half-rate; 3200 is the closer perceptual match to a real Phase 2 radio on a strong signal.",
+            "env_variable": "VOICED_CODEC2_MODE",
+            "default_value": "3200",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|in:2400,3200"
+        },
+        {
+            "name": "Server list cache",
+            "description": "Last good platform response. The dashboard being down should degrade the platform, not stop it.",
+            "env_variable": "VOICED_CACHE",
+            "default_value": "/home/container/servers.cache.json",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string"
+        },
+        {
+            "name": "Local server store",
+            "description": "Hand-enrolled servers, used when no platform is configured.",
+            "env_variable": "VOICED_STORE",
+            "default_value": "/home/container/servers.json",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string"
+        }
+    ]
+}
