@@ -569,7 +569,22 @@ impl Talker {
         let n = self.opus_in.decode(opus_packet, &mut wide, false)?;
         wide.truncate(n);
 
-        self.decimator.push(&wide, &mut self.pending);
+        self.push_wide(&wide, qualities)
+    }
+
+    /// The same chain, fed 48 kHz PCM directly.
+    ///
+    /// A dispatch console has no Opus in the path: the browser captures at the
+    /// device rate and sends samples, so decoding would mean encoding first,
+    /// purely to decode it again. Everything downstream - decimate, high-pass,
+    /// AGC, vocoder, the speaker chain - is the same code, so a console and a
+    /// radio sound like the same network rather than like two systems.
+    pub fn push_pcm(&mut self, wide: &[i16], qualities: &[u8]) -> Result<Vec<(u8, Vec<i16>)>> {
+        self.push_wide(wide, qualities)
+    }
+
+    fn push_wide(&mut self, wide: &[i16], qualities: &[u8]) -> Result<Vec<(u8, Vec<i16>)>> {
+        self.decimator.push(wide, &mut self.pending);
 
         let spf = self.encoder.samples_per_frame();
         let mut out: Vec<(u8, Vec<i16>)> = Vec::new();

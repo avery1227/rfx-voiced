@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::control::Shared;
 use crate::router::ClientId;
 
 /// Wire format, first byte is the frame kind.
@@ -41,6 +42,14 @@ pub const KIND_AUDIO: u8 = 1;
 /// the first samples shows the channel clear while somebody is already
 /// talking, and clear again in every gap between words.
 pub const KIND_CALL: u8 = 2;
+/// A transmit request was refused, and why. `[3][0][u16 tg][utf8 reason]`
+pub const KIND_DENY: u8 = 3;
+
+// Inbound, from a console. Numbered well clear of the outbound kinds so a
+// frame going the wrong way is obviously wrong rather than subtly valid.
+const TX_KEY: u8 = 16;
+const TX_UNKEY: u8 = 17;
+const TX_AUDIO: u8 = 18;
 
 /// Where the PCM starts in an audio frame.
 pub const AUDIO_HEADER: usize = 4;
@@ -103,6 +112,18 @@ impl Streams {
         let _ = sink.try_send(frame);
     }
 
+    pub fn send_deny(&mut self, client: ClientId, tg: u32, reason: &str) {
+        let Some(sink) = self.sinks.get(&client) else {
+            return;
+        };
+        let mut frame = Vec::with_capacity(4 + reason.len());
+        frame.push(KIND_DENY);
+        frame.push(0);
+        frame.extend_from_slice(&(tg as u16).to_be_bytes());
+        frame.extend_from_slice(reason.as_bytes());
+        let _ = sink.try_send(frame);
+    }
+
     pub fn send_pcm(&mut self, client: ClientId, tg: u32, pcm: &[i16]) {
         let Some(sink) = self.sinks.get(&client) else {
             return;
@@ -122,13 +143,14 @@ impl Streams {
     }
 }
 
-pub async fn serve(addr: String, streams: SharedStreams) -> Result<()> {
+pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("audio stream listening on {addr}");
 
     loop {
         let (socket, peer) = listener.accept().await?;
         let streams = streams.clone();
+        let router = router.clone();
 
         tokio::spawn(async move {
             // The token arrives in the request URI. Captured during the
@@ -213,11 +235,141 @@ pub async fn serve(addr: String, streams: SharedStreams) -> Result<()> {
                 }
             });
 
-            // We expect nothing from the client; reading is only how we learn
-            // the socket has closed.
+            // A console transmits over this same socket. Keying by HTTP would
+            // add a round trip to every press, and push-to-talk latency is the
+            // one thing a dispatcher feels immediately.
+            let mut talker: Option<crate::dsp::Talker> = None;
+
             while let Some(Ok(msg)) = rx_ws.next().await {
                 if msg.is_close() {
                     break;
+                }
+                let Message::Binary(buf) = msg else { continue };
+                if buf.len() < 4 {
+                    continue;
+                }
+
+                let kind = buf[0];
+                let tg = u16::from_be_bytes([buf[2], buf[3]]) as u32;
+
+                match kind {
+                    TX_KEY => {
+                        // The router decides, exactly as it does for a radio.
+                        // This is the platform's global no-double rule, and a
+                        // console gets no exemption from it: if a field unit
+                        // holds the talkgroup, dispatch is refused and told so.
+                        let outcome = {
+                            let mut r = match router.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            r.key(tg, client)
+                        };
+
+                        let mut s = match streams.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        match outcome {
+                            Ok(()) => {
+                                println!("console {client} keyed tg {tg}");
+                                s.send_call(client, tg, true, "DISPATCH");
+                            }
+                            Err(e) => {
+                                println!("console {client} refused tg {tg}: {e}");
+                                s.send_deny(client, tg, e);
+                            }
+                        }
+                    }
+
+                    TX_UNKEY => {
+                        {
+                            let mut r = match router.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            // Only release what we actually hold. An unkey for
+                            // somebody else's call would be a console able to
+                            // cut off a field unit by asking nicely.
+                            if r.destination_of(client).map(|(t, _)| t) == Some(tg) {
+                                r.unkey(tg);
+                            }
+                        }
+                        let mut s = match streams.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        s.send_call(client, tg, false, "");
+                    }
+
+                    TX_AUDIO => {
+                        // The talkgroup comes from the ROUTER, not the frame.
+                        // Taking it from the frame would let a position
+                        // transmit on a talkgroup it never keyed.
+                        let dest = {
+                            let r = match router.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            r.destination_of(client)
+                        };
+                        let Some((live_tg, listeners)) = dest else {
+                            continue;
+                        };
+                        if listeners.is_empty() {
+                            continue;
+                        }
+
+                        // 48 kHz mono i16, little endian, after the 4-byte
+                        // header - the same alignment reason as outbound.
+                        let pcm: Vec<i16> = buf[AUDIO_HEADER..]
+                            .chunks_exact(2)
+                            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                            .collect();
+
+                        if talker.is_none() {
+                            match crate::dsp::Talker::new() {
+                                Ok(t) => talker = Some(t),
+                                Err(e) => {
+                                    eprintln!("console {client}: vocoder: {e}");
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let qualities: Vec<u8> = listeners.iter().map(|(_, q)| *q).collect();
+                        let Some(t) = talker.as_mut() else { continue };
+                        let Ok(lanes) = t.push_pcm(&pcm, &qualities) else {
+                            continue;
+                        };
+
+                        let mut s = match streams.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        for (lane, pcm8) in &lanes {
+                            for (c, q) in &listeners {
+                                if crate::dsp::lane_of(*q) == *lane {
+                                    s.send_pcm(*c, live_tg, pcm8);
+                                }
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+
+            // A socket that drops mid-transmission must not leave the
+            // talkgroup keyed against everybody else on it.
+            {
+                let mut r = match router.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                if let Some((tg, _)) = r.destination_of(client) {
+                    println!("console {client} dropped while keyed on tg {tg}");
+                    r.unkey(tg);
                 }
             }
 

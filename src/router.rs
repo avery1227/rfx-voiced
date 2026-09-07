@@ -182,6 +182,28 @@ impl Router {
         }
     }
 
+    /// What this client is keyed into, and who should hear it.
+    ///
+    /// The console equivalent of `destination`, which starts from a Mumble
+    /// session. A console has no session - it is not a player anywhere - so it
+    /// is looked up by identity instead. The ROUTER decides what it is keyed
+    /// to; the client saying so in a frame would let a position transmit on a
+    /// talkgroup it never asked for and was never granted.
+    pub fn destination_of(&self, speaker: ClientId) -> Option<(u32, Vec<(ClientId, u8)>)> {
+        for (&tg, route) in &self.routes {
+            if route.keyed == Some(speaker) {
+                let listeners = route
+                    .members
+                    .iter()
+                    .filter(|(&c, m)| m.listen && c != speaker)
+                    .map(|(&c, m)| (c, m.quality))
+                    .collect();
+                return Some((tg, listeners));
+            }
+        }
+        None
+    }
+
     /// Who is listening to a talkgroup. Used to tell consoles a call has
     /// started before there is any audio to tell them with.
     pub fn listeners_of(&self, tg: u32) -> Vec<ClientId> {

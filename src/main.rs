@@ -215,8 +215,9 @@ async fn main() -> Result<()> {
 
     {
         let streams = streams.clone();
+        let shared = shared.clone();
         tokio::spawn(async move {
-            if let Err(e) = stream::serve(stream_addr, streams).await {
+            if let Err(e) = stream::serve(stream_addr, streams, shared).await {
                 eprintln!("audio stream stopped: {e}");
             }
         });
