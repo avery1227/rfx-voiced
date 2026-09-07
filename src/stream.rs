@@ -271,8 +271,19 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             Err(p) => p.into_inner(),
                         };
                         match outcome {
-                            Ok(()) => {
-                                println!("console {client} keyed tg {tg}");
+                            Ok(keyed) => {
+                                if let crate::router::Keyed::Preempted(was) = keyed {
+                                    // Tell the unit it was cut off. Its own
+                                    // server still believes it is talking, and
+                                    // it will find out on its next attempt -
+                                    // but the person holding the radio should
+                                    // hear about it now, not later.
+                                    println!("console {client} PREEMPTED {was} on tg {tg}");
+                                    s.send_deny(was, tg, "preempted by dispatch");
+                                    s.send_call(was, tg, false, "");
+                                } else {
+                                    println!("console {client} keyed tg {tg}");
+                                }
                                 s.send_call(client, tg, true, "DISPATCH");
                             }
                             Err(e) => {
@@ -291,9 +302,7 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             // Only release what we actually hold. An unkey for
                             // somebody else's call would be a console able to
                             // cut off a field unit by asking nicely.
-                            if r.destination_of(client).map(|(t, _)| t) == Some(tg) {
-                                r.unkey(tg);
-                            }
+                            r.unkey_as(tg, client);
                         }
                         let mut s = match streams.lock() {
                             Ok(g) => g,

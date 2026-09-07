@@ -29,6 +29,11 @@ pub struct ClientId {
 }
 
 impl ClientId {
+    /// Consoles live on server 0, which no enrolled world can ever be.
+    pub fn is_console(&self) -> bool {
+        self.server == crate::control::CONSOLE_SERVER
+    }
+
     pub fn new(server: u32, player: u32) -> Self {
         Self { server, player }
     }
@@ -68,6 +73,14 @@ pub struct Route {
     /// The current grant holder, if any. Talkgroups are GLOBAL, so this is the
     /// one place doubling is prevented across every server at once.
     pub keyed: Option<ClientId>,
+}
+
+/// What happened to a key request. Preemption carries whoever was cut off, so
+/// they can be told rather than simply going quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keyed {
+    Granted,
+    Preempted(ClientId),
 }
 
 #[derive(Debug, Default)]
@@ -156,13 +169,38 @@ impl Router {
     /// across every server, so two FXServers can each believe they granted TG
     /// 1001 - and exactly one of them is right. Whichever arrives second is
     /// refused here, and its server turns that into a bonk.
-    pub fn key(&mut self, tg: u32, client: ClientId) -> Result<(), &'static str> {
+    pub fn key(&mut self, tg: u32, client: ClientId) -> Result<Keyed, &'static str> {
         let route = self.routes.get_mut(&tg).ok_or("no such route")?;
+
         match route.keyed {
-            Some(existing) if existing != client => Err("route already keyed"),
-            _ => {
+            // Already ours. A repeat inside hang time, which is a reply, not a
+            // new transmission.
+            Some(existing) if existing == client => Ok(Keyed::Granted),
+
+            Some(holder) => {
+                // DISPATCH PREEMPTS. A console takes a channel from a field
+                // unit, the way it does on a real system: the dispatcher is
+                // the one with the whole picture, and making them wait for
+                // somebody's long-winded traffic is exactly backwards when
+                // they have something urgent to say.
+                //
+                // The reverse is refused - a subscriber cannot take a channel
+                // from dispatch - and console against console is refused too,
+                // because two dispatchers colliding is a coordination problem
+                // and giving one of them a silent win only hides it.
+                if client.is_console() && !holder.is_console() {
+                    route.keyed = Some(client);
+                    Ok(Keyed::Preempted(holder))
+                } else if !client.is_console() && holder.is_console() {
+                    Err("dispatch is transmitting")
+                } else {
+                    Err("route already keyed")
+                }
+            }
+
+            None => {
                 route.keyed = Some(client);
-                Ok(())
+                Ok(Keyed::Granted)
             }
         }
     }
@@ -219,6 +257,23 @@ impl Router {
             .unwrap_or_default()
     }
 
+    /// Releases a talkgroup, but only for whoever actually holds it.
+    ///
+    /// Unconditional release is a bug once preemption exists: the unit that
+    /// was cut off still sends its own unkey when the operator lets go of the
+    /// button, and that would end the dispatcher's transmission a second after
+    /// it started.
+    pub fn unkey_as(&mut self, tg: u32, client: ClientId) -> bool {
+        match self.routes.get_mut(&tg) {
+            Some(route) if route.keyed == Some(client) => {
+                route.keyed = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Unconditional release, for teardown paths that own the route outright.
     pub fn unkey(&mut self, tg: u32) {
         if let Some(route) = self.routes.get_mut(&tg) {
             route.keyed = None;
@@ -422,5 +477,80 @@ mod tests {
             "server B is untouched"
         );
         assert!(r.key(1001, cli(B, 5)).is_ok(), "and the talkgroup is free");
+    }
+
+    // -- Dispatch priority --------------------------------------------------
+
+    fn keyed_route(tg: u32) -> Router {
+        let mut r = Router::default();
+        r.open(tg, false);
+        r
+    }
+
+    #[test]
+    fn dispatch_takes_a_channel_from_a_field_unit() {
+        let mut r = keyed_route(1001);
+        let unit = ClientId::new(1, 7);
+        let console = ClientId::new(0, 1);
+
+        assert_eq!(r.key(1001, unit), Ok(Keyed::Granted));
+        assert_eq!(
+            r.key(1001, console),
+            Ok(Keyed::Preempted(unit)),
+            "dispatch preempts, and says who it cut off"
+        );
+        assert_eq!(r.destination_of(console).map(|(t, _)| t), Some(1001));
+    }
+
+    #[test]
+    fn a_field_unit_cannot_take_a_channel_from_dispatch() {
+        let mut r = keyed_route(1001);
+        let console = ClientId::new(0, 1);
+
+        assert!(r.key(1001, console).is_ok());
+        assert_eq!(
+            r.key(1001, ClientId::new(1, 7)),
+            Err("dispatch is transmitting")
+        );
+    }
+
+    #[test]
+    fn two_consoles_do_not_preempt_each_other() {
+        let mut r = keyed_route(1001);
+        assert!(r.key(1001, ClientId::new(0, 1)).is_ok());
+        assert_eq!(
+            r.key(1001, ClientId::new(0, 2)),
+            Err("route already keyed"),
+            "two dispatchers colliding is a coordination problem, not a priority one"
+        );
+    }
+
+    #[test]
+    fn a_preempted_unit_releasing_does_not_end_dispatch() {
+        let mut r = keyed_route(1001);
+        let unit = ClientId::new(1, 7);
+        let console = ClientId::new(0, 1);
+
+        r.key(1001, unit).unwrap();
+        r.key(1001, console).unwrap();
+
+        // The operator lets go of a button they no longer hold the channel with.
+        assert!(!r.unkey_as(1001, unit));
+        assert_eq!(
+            r.destination_of(console).map(|(t, _)| t),
+            Some(1001),
+            "dispatch is still transmitting"
+        );
+
+        assert!(r.unkey_as(1001, console));
+        assert_eq!(r.destination_of(console), None);
+    }
+
+    #[test]
+    fn keying_twice_is_a_reply_not_a_collision() {
+        let mut r = keyed_route(1001);
+        let unit = ClientId::new(1, 7);
+        assert_eq!(r.key(1001, unit), Ok(Keyed::Granted));
+        assert_eq!(r.key(1001, unit), Ok(Keyed::Granted));
     }
 }

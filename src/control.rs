@@ -367,7 +367,7 @@ fn dispatch(
 
         "key" => match (u32_of(body, "tg"), client_of(server, body)) {
             (Some(tg), Some(client)) => match r.key(tg, client) {
-                Ok(()) => {
+                Ok(_) => {
                     // Tell consoles the moment the grant lands, before any
                     // audio exists. A console is a supervisory position: it
                     // needs to see that a channel is taken, not wait to hear
@@ -410,7 +410,14 @@ fn dispatch(
         "unkey" => match u32_of(body, "tg") {
             Some(tg) => {
                 announce_call(&r, streams, tg, false, "");
-                r.unkey(tg);
+                // Scoped to the caller when it names one: dispatch can preempt a
+                // unit, and the preempted unit still sends its own unkey.
+                match client_of(server, body) {
+                    Some(c) => {
+                        r.unkey_as(tg, c);
+                    }
+                    None => r.unkey(tg),
+                }
                 println!("UNKEY        tg {tg}");
                 (200, json!({ "ok": true }))
             }
