@@ -1,5 +1,5 @@
 {
-    "_comment": "InteropHQ voice node. Built once at install; the startup command runs the binary. Needs TWO allocations: the primary is the control API (FXServer -> node) and a second is the audio stream (players' browsers -> node).",
+    "_comment": "InteropHQ voice node. Installs a prebuilt binary from a GitHub release; no compiler is needed at runtime or at install. Needs TWO allocations: the primary is the control API (FXServer -> node) and a second is the audio stream (players -> node).",
     "meta": {
         "version": "PTDL_v2",
         "update_url": null
@@ -11,8 +11,7 @@
     "description": "rfx-voiced - the P25 voice node. Taps each FXServer's built-in Mumble server, runs the vocoder chain, and streams radio audio to game clients. Pulls its server list from InteropHQ when a platform key is set, and falls back to a local servers.json when it is not.",
     "features": null,
     "docker_images": {
-        "Debian 12 (bookworm)": "ghcr.io/parkervcp/yolks:debian",
-        "Rust (fallback, same base)": "ghcr.io/parkervcp/yolks:rust_latest"
+        "Debian (yolks)": "ghcr.io/parkervcp/yolks:debian"
     },
     "file_denylist": [],
     "startup": "VOICED_CONTROL=0.0.0.0:${SERVER_PORT} VOICED_STREAM=0.0.0.0:${VOICED_STREAM_PORT} ./rfx-voiced",

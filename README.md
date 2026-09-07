@@ -85,6 +85,12 @@ cargo build --release
 
 `Dockerfile` builds it in two stages and produces a small runtime image.
 
+The binary links only libc, libm and libgcc - libopus and ring are static, and
+rustls carries its own root store - so it runs on any glibc at least as new as
+the one it was built against. CI builds on Debian 12; the Pelican runtime image
+is Debian 13. Do not run it on Alpine: musl is a different libc, not an older
+one.
+
 ## Pelican
 
 `egg-interophq-voice-node.json` is a ready-to-import egg. It builds once at
