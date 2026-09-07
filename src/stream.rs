@@ -111,6 +111,11 @@ pub async fn serve(addr: String, streams: SharedStreams) -> Result<()> {
             let token = Arc::new(Mutex::new(None::<String>));
             let captured = token.clone();
 
+            // The Err variant is tungstenite's Response, and its size is fixed by
+            // the callback signature the handshake requires - there is nothing
+            // here to box. Clippy is right about the size and wrong about who
+            // can do anything about it.
+            #[allow(clippy::result_large_err)]
             let ws =
                 tokio_tungstenite::accept_hdr_async(socket, move |req: &Request, res: Response| {
                     if let Some(q) = req.uri().query() {
