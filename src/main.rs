@@ -124,7 +124,14 @@ fn cli(args: &[String]) -> Result<bool> {
             Ok(true)
         }
 
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("{}", env!("VOICED_VERSION"));
+            Ok(true)
+        }
+
         Some("help") | Some("--help") | Some("-h") => {
+            println!("rfx-voiced {}", env!("VOICED_VERSION"));
+            println!();
             println!("rfx-voiced                       run the voice node");
             println!("rfx-voiced enroll <name> <host:port>   add a server, print its key");
             println!("rfx-voiced list                  show enrolled servers");
@@ -139,6 +146,10 @@ fn cli(args: &[String]) -> Result<bool> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // First line of every run, so a log answers "which build is this" without
+    // anyone having to infer it from behaviour.
+    println!("rfx-voiced {}", env!("VOICED_VERSION"));
+
     mumble::install_crypto_provider()?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();

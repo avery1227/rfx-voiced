@@ -20,6 +20,16 @@ binary already on disk and downloads nothing. Only the install script fetches,
 and it pulls the latest GitHub release. A restart after tagging appears to
 work and changes nothing, which is a confusing half-hour if you forget.
 
+The node prints its version as the first line of every run:
+
+```
+rfx-voiced v0.1.3
+```
+
+That is how you confirm a deploy took. `./rfx-voiced --version` says the same.
+Before this existed the only way to tell was to infer it from behaviour, and a
+restart that changed nothing looked identical to a successful update.
+
 Reinstall is safe here: the install script writes only the binary and never
 touches `servers.json`, the cache, or anything else in the volume.
 
