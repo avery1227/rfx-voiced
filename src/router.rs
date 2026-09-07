@@ -182,6 +182,21 @@ impl Router {
         }
     }
 
+    /// Who is listening to a talkgroup. Used to tell consoles a call has
+    /// started before there is any audio to tell them with.
+    pub fn listeners_of(&self, tg: u32) -> Vec<ClientId> {
+        self.routes
+            .get(&tg)
+            .map(|r| {
+                r.members
+                    .iter()
+                    .filter(|(_, m)| m.listen)
+                    .map(|(&c, _)| c)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn unkey(&mut self, tg: u32) {
         if let Some(route) = self.routes.get_mut(&tg) {
             route.keyed = None;

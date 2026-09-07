@@ -34,6 +34,13 @@ use crate::router::ClientId;
 /// size, and it throws rather than reading slowly.
 pub const KIND_HELLO: u8 = 0;
 pub const KIND_AUDIO: u8 = 1;
+/// A call started or ended on a talkgroup.
+///
+/// Sent when the GRANT is decided, not when audio arrives. A radio is busy
+/// from the instant its transmission is approved; a console that waits for
+/// the first samples shows the channel clear while somebody is already
+/// talking, and clear again in every gap between words.
+pub const KIND_CALL: u8 = 2;
 
 /// Where the PCM starts in an audio frame.
 pub const AUDIO_HEADER: usize = 4;
@@ -78,6 +85,24 @@ impl Streams {
     /// Drops the frame rather than blocking if that player's socket is
     /// backed up. Late radio audio is worse than missing radio audio - a
     /// stalled listener must never hold up the vocoder for everyone else.
+    /// `[2][keyed][u16 tg BE][utf8 talker]`
+    ///
+    /// The talker is a label rather than an id: whatever the server called the
+    /// unit, or empty when it did not say.
+    pub fn send_call(&mut self, client: ClientId, tg: u32, keyed: bool, talker: &str) {
+        let Some(sink) = self.sinks.get(&client) else {
+            return;
+        };
+
+        let mut frame = Vec::with_capacity(4 + talker.len());
+        frame.push(KIND_CALL);
+        frame.push(u8::from(keyed));
+        frame.extend_from_slice(&(tg as u16).to_be_bytes());
+        frame.extend_from_slice(talker.as_bytes());
+
+        let _ = sink.try_send(frame);
+    }
+
     pub fn send_pcm(&mut self, client: ClientId, tg: u32, pcm: &[i16]) {
         let Some(sink) = self.sinks.get(&client) else {
             return;

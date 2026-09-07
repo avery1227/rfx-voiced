@@ -272,6 +272,30 @@ fn dispatch_console(
     }
 }
 
+/// Push a call event to every CONSOLE listening to a talkgroup.
+///
+/// Consoles only. Game clients learn about calls from their own server, which
+/// already knows - sending it twice would mean two sources of truth for the
+/// same fact, disagreeing whenever one is late.
+fn announce_call(r: &Router, streams: &SharedStreams, tg: u32, keyed: bool, talker: &str) {
+    let consoles: Vec<_> = r
+        .listeners_of(tg)
+        .into_iter()
+        .filter(|c| c.server == CONSOLE_SERVER)
+        .collect();
+    if consoles.is_empty() {
+        return;
+    }
+
+    let mut s = match streams.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    for c in consoles {
+        s.send_call(c, tg, keyed, talker);
+    }
+}
+
 fn u32_of(v: &Value, key: &str) -> Option<u32> {
     v.get(key).and_then(|x| x.as_u64()).map(|x| x as u32)
 }
@@ -344,6 +368,20 @@ fn dispatch(
         "key" => match (u32_of(body, "tg"), client_of(server, body)) {
             (Some(tg), Some(client)) => match r.key(tg, client) {
                 Ok(()) => {
+                    // Tell consoles the moment the grant lands, before any
+                    // audio exists. A console is a supervisory position: it
+                    // needs to see that a channel is taken, not wait to hear
+                    // it, and every gap between words would otherwise read as
+                    // the channel going clear.
+                    let unit = body
+                        .get("unit")
+                        .map(|v| match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default();
+                    announce_call(&r, streams, tg, true, &unit);
+
                     let bound = r.session_of(client).is_some();
                     println!(
                         "KEY          tg {tg} <- {client}{}",
@@ -371,6 +409,7 @@ fn dispatch(
 
         "unkey" => match u32_of(body, "tg") {
             Some(tg) => {
+                announce_call(&r, streams, tg, false, "");
                 r.unkey(tg);
                 println!("UNKEY        tg {tg}");
                 (200, json!({ "ok": true }))
