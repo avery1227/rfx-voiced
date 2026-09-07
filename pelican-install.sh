@@ -88,6 +88,13 @@ install_from_source() {
     fi
 
     local src=/mnt/server/source
+
+    # The checkout is owned by the server's uid, and this script runs as root.
+    # Git refuses to touch a repository owned by somebody else - a sensible
+    # default on a shared machine, and exactly wrong here, where "somebody
+    # else" is the container this very install is for.
+    git config --global --add safe.directory '*'
+
     if [ -d "${src}/.git" ]; then
         echo "updating existing checkout"
         cd "${src}"
