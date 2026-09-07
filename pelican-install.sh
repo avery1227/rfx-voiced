@@ -1,88 +1,133 @@
 #!/bin/bash
-# Voice node installation script, for the Pelican egg.
+# InteropHQ voice node - install
 #
 # Server Files: /mnt/server
 #
-# This replaces the stock Rust Bot installer, which only clones the repository
-# and leaves `cargo run --release` as the startup command. That recompiles on
-# every boot - a cold cache is 180 crates plus libopus from source - which is
-# minutes of CPU on a host that is also running game servers, with voice down
-# the whole time. Here the build happens ONCE, at install, and the startup
-# command runs the binary.
+# Two modes:
 #
-# INSTALL CONTAINER must have cargo, cmake and g++. Use the same image as the
-# runtime one (Dockerfile.yolk); the stock Rust yolk has none of the three that
-# matter, which is what makes libopus fail to build.
+#   release  download the prebuilt binary from a GitHub release. Seconds, and
+#            no compiler, so it cannot run the panel out of memory. Default.
+#   source   clone and cargo build. Needs ~2GB and several minutes.
+#
+# Building on the panel was the original design and it was wrong: rustc runs
+# one process per core, each wanting hundreds of megabytes, and Pelican gives
+# the install container the server's memory limit. A 1GB server OOM-kills the
+# build partway through with SIGKILL and no explanation beyond "signal: 9".
 
 set -e
 
-apt update
-apt install -y --no-install-recommends git ca-certificates
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl jq git
 
 mkdir -p /mnt/server
 cd /mnt/server
 
-# Cargo writes to $HOME. Without this it tries to use root's, which is not on
-# the volume, so the registry cache is thrown away with the container.
 export HOME=/mnt/server
 export CARGO_HOME=/mnt/server/.cargo
 
-## add git ending if it's not on the address
 if [[ ${GIT_ADDRESS} != *.git ]]; then
     GIT_ADDRESS=${GIT_ADDRESS}.git
 fi
 
-if [ -z "${USERNAME}" ] && [ -z "${ACCESS_TOKEN}" ]; then
-    echo -e "using anon api call"
-else
-    GIT_ADDRESS="https://${USERNAME}:${ACCESS_TOKEN}@$(echo -e ${GIT_ADDRESS} | cut -d/ -f3-)"
+# NEVER echo a URL after credentials have been spliced into it. The panel's
+# install log is visible to anyone with access to the server, is kept, and is
+# the first thing people paste when asking for help - so a token printed here
+# is a token to treat as public.
+REPO=$(echo "${GIT_ADDRESS}" | sed -E 's#.*github\.com[:/]([^/]+/[^/]+)\.git#\1#')
+AUTH_URL="${GIT_ADDRESS}"
+if [ -n "${USERNAME}" ] && [ -n "${ACCESS_TOKEN}" ]; then
+    AUTH_URL="https://${USERNAME}:${ACCESS_TOKEN}@$(echo -e ${GIT_ADDRESS} | cut -d/ -f3-)"
 fi
 
-if [ "$(ls -A /mnt/server)" ]; then
-    echo -e "/mnt/server directory is not empty."
-    if [ -d .git ]; then
-        echo -e ".git directory exists"
-        if [ -f .git/config ]; then
-            echo -e "loading info from git config"
-            ORIGIN=$(git config --get remote.origin.url)
-        else
-            echo -e "files found with no git config"
-            echo -e "closing out without touching things to not break anything"
-            exit 10
-        fi
+BRANCH="${BRANCH:-main}"
+MODE="${INSTALL_MODE:-release}"
+
+install_from_release() {
+    echo "looking for the latest release of ${REPO}"
+
+    local hdr=(-H "Accept: application/vnd.github+json")
+    [ -n "${ACCESS_TOKEN}" ] && hdr+=(-H "Authorization: Bearer ${ACCESS_TOKEN}")
+
+    local json
+    json=$(curl -fsSL "${hdr[@]}" "https://api.github.com/repos/${REPO}/releases/latest") || return 1
+
+    local tag asset_id
+    tag=$(echo "${json}" | jq -r '.tag_name // empty')
+    asset_id=$(echo "${json}" | jq -r \
+        '.assets[]? | select(.name | endswith("x86_64-unknown-linux-gnu.tar.gz")) | .id' | head -1)
+
+    [ -n "${asset_id}" ] || return 1
+    echo "found ${tag}, asset ${asset_id}"
+
+    # The asset endpoint, not browser_download_url: that one is unauthenticated
+    # and 404s on a private repository.
+    curl -fsSL "${hdr[@]}" -H "Accept: application/octet-stream" \
+        "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}" \
+        -o /tmp/voiced.tar.gz || return 1
+
+    tar -xzf /tmp/voiced.tar.gz -C /tmp
+    local bin
+    bin=$(find /tmp -maxdepth 3 -type f -name rfx-voiced | head -1)
+    [ -n "${bin}" ] || return 1
+
+    cp "${bin}" /mnt/server/rfx-voiced
+    chmod +x /mnt/server/rfx-voiced
+    rm -rf /tmp/voiced.tar.gz
+    echo "installed ${tag} from release"
+}
+
+install_from_source() {
+    echo "building from source"
+    apt-get install -y --no-install-recommends cmake g++ curl build-essential
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --no-modify-path
+        export PATH="${CARGO_HOME}/bin:${PATH}"
     fi
 
-    if [ "${ORIGIN}" == "${GIT_ADDRESS}" ]; then
-        echo "pulling latest from github"
-        git pull
-    fi
-else
-    echo -e "/mnt/server is empty.\ncloning files into repo"
-    if [ -z ${BRANCH} ]; then
-        echo -e "cloning default branch"
-        git clone ${GIT_ADDRESS} .
+    local src=/mnt/server/source
+    if [ -d "${src}/.git" ]; then
+        echo "updating existing checkout"
+        cd "${src}"
+        git remote set-url origin "${AUTH_URL}"
+        git fetch --all --prune
+        git reset --hard "origin/${BRANCH}"
     else
-        echo -e "cloning ${BRANCH}'"
-        git clone --single-branch --branch ${BRANCH} ${GIT_ADDRESS} .
+        echo "cloning ${REPO} (${BRANCH})"
+        rm -rf "${src}"
+        git clone --depth 1 --single-branch --branch "${BRANCH}" "${AUTH_URL}" "${src}"
     fi
+
+    cd "${src}/${CRATE_DIR:-.}"
+    [ -f Cargo.toml ] || { echo "no Cargo.toml at ${CRATE_DIR:-.}"; exit 1; }
+
+    # Two jobs, not one per core. Peak memory is roughly jobs x rustc, and the
+    # install container inherits the server's memory limit - unbounded
+    # parallelism is what turns a 1GB server into a SIGKILL halfway through
+    # compiling syn.
+    echo "building with ${CARGO_JOBS:-2} job(s) - the slow part, and it only happens here"
+    cargo build --release --jobs "${CARGO_JOBS:-2}"
+
+    cp target/release/rfx-voiced /mnt/server/rfx-voiced
+    chmod +x /mnt/server/rfx-voiced
+    rm -rf target
+}
+
+if [ "${MODE}" = "source" ]; then
+    install_from_source
+elif ! install_from_release; then
+    echo "no usable release found - falling back to building from source"
+    install_from_source
 fi
 
-# The crate is not necessarily at the repository root - this repo keeps it at
-# resources/[local]/rfx_p25/voiced. CRATE_DIR is an egg variable so the same
-# script works for a repo that is only the node.
-CRATE_DIR="${CRATE_DIR:-.}"
-cd "/mnt/server/${CRATE_DIR}"
+# Leaving a broken install to be discovered at startup as "No such file or
+# directory" wastes the one place that could have said what went wrong.
+if [ ! -x /mnt/server/rfx-voiced ]; then
+    echo "INSTALL FAILED - no binary at /mnt/server/rfx-voiced"
+    exit 1
+fi
 
-echo -e "building rfx-voiced (this is the slow part, and it only happens here)"
-cargo build --release
-
-cp target/release/rfx-voiced /mnt/server/rfx-voiced
-chmod +x /mnt/server/rfx-voiced
-
-# target/ is several GB of intermediates and the binary is already copied out.
-# Keeping it would count against the server's disk quota for no benefit; a
-# reinstall rebuilds from the registry cache in .cargo, which is kept.
-rm -rf target
-
-echo -e "install complete - start command should be ./rfx-voiced"
+echo "install complete - $(/mnt/server/rfx-voiced help | head -1)"
 exit 0
