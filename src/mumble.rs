@@ -372,10 +372,10 @@ pub async fn run(
                                     t.started = now;
                                     t.packets = 0;
                                     t.bytes = 0;
-                                    t.routed_to = dest.as_ref().map(|(tg, _)| *tg);
+                                    t.routed_to = dest.as_ref().map(|(tg, _, _)| *tg);
 
                                     match &dest {
-                                        Some((tg, listeners)) => println!(
+                                        Some((tg, _, listeners)) => println!(
                                             "TX start  {who:<28} -> tg {tg}, {} listener(s)  [codec {} target {}]",
                                             listeners.len(), v.codec, v.target),
                                         None => println!(
@@ -389,7 +389,7 @@ pub async fn run(
                                 t.last = now;
 
                                 // Vocode and deliver.
-                                if let Some((tg, listeners)) = dest {
+                                if let Some((tg, src, listeners)) = dest {
                                     if !listeners.is_empty() && v.codec == 4 && v.payload_len > 0 {
                                         let payload = &body[v.payload_start..v.payload_start + v.payload_len];
 
@@ -407,36 +407,45 @@ pub async fn run(
                                         };
 
                                         if let Some(talker) = talker {
-                                            let qualities: Vec<u8> =
-                                                listeners.iter().map(|(_, q)| *q).collect();
+                                            let sinks: Vec<dsp::Sink> =
+                                                listeners.iter().map(|l| l.sink()).collect();
 
-                                            match talker.push(payload, &qualities) {
+                                            match talker.push(payload, src, &sinks) {
                                                 Ok(lanes) => {
                                                     // AM does not capture, so more
                                                     // than one radio can be up on
-                                                    // this frequency at once. What a
-                                                    // listener hears then is the sum,
-                                                    // and it has to be summed here -
-                                                    // two talkers' frames arriving at
-                                                    // one client would interleave into
+                                                    // this frequency at once and what
+                                                    // a listener hears is the sum. It
+                                                    // has to be summed here: two
+                                                    // talkers' frames arriving at one
+                                                    // client would interleave into
                                                     // alternating chunks of each.
-                                                    let colliding = router
+                                                    //
+                                                    // Only the AM renderings. The same
+                                                    // transmission patched onto a P25
+                                                    // talkgroup is not colliding
+                                                    // there - that side has a grant.
+                                                    let out = if router
                                                         .lock()
                                                         .ok()
-                                                        .map(|r| r.talkers_on(tg).len())
-                                                        .unwrap_or(1)
-                                                        > 1;
-
-                                                    let out = if colliding {
+                                                        .is_some_and(|r| r.am_collision(tg))
+                                                    {
                                                         let mix = ammix.entry(tg).or_default();
-                                                        for (lane, pcm) in &lanes {
-                                                            mix.add(*lane, v.session, pcm, now);
+                                                        let mut rest = Vec::new();
+                                                        for (key, pcm) in lanes {
+                                                            if key.0 == dsp::Mode::Am {
+                                                                mix.add(key, v.session, &pcm, now);
+                                                            } else {
+                                                                rest.push((key, pcm));
+                                                            }
                                                         }
-                                                        mix.drain(now)
+                                                        let mut mixed = mix.drain(now);
+                                                        mixed.extend(rest);
+                                                        mixed
                                                     } else {
                                                         // A collision that just ended:
-                                                        // what is still queued belongs to
-                                                        // whoever is left.
+                                                        // what is still queued belongs
+                                                        // to whoever is left.
                                                         match ammix.remove(&tg) {
                                                             Some(mut mix) => {
                                                                 let mut out = mix.flush();
@@ -447,28 +456,38 @@ pub async fn run(
                                                         }
                                                     };
 
-                                                    // Record the CLEANEST lane that
-                                                    // exists. What is kept should be
-                                                    // the call, not one listener's bad
-                                                    // reception of it - a recording
-                                                    // nobody can make out is not
-                                                    // evidence of anything.
-                                                    if let Some((_, best)) =
-                                                        out.iter().min_by_key(|(lane, _)| *lane)
-                                                    {
+                                                    // Record what the SOURCE side
+                                                    // heard, cleanest lane. Not a
+                                                    // patched rendering: the call
+                                                    // happened on one channel, and
+                                                    // keeping the version that went
+                                                    // through two extra hops would be
+                                                    // keeping the worst copy of it.
+                                                    // Not one listener's bad reception
+                                                    // either - a recording nobody can
+                                                    // make out is not evidence of
+                                                    // anything.
+                                                    let best = out
+                                                        .iter()
+                                                        .filter(|((m, _, bridged), _)| {
+                                                            !bridged && *m == src.mode
+                                                        })
+                                                        .max_by_key(|((_, lane, _), _)| *lane);
+
+                                                    if let Some((_, pcm)) = best {
                                                         if let Ok(mut r) = recorder.lock() {
-                                                            r.push(tg, best);
+                                                            r.push(tg, pcm);
                                                         }
                                                     }
 
                                                     if let Ok(mut s) = streams.lock() {
-                                                        for (lane, pcm) in &out {
+                                                        for (key, pcm) in &out {
                                                             if pcm.is_empty() {
                                                                 continue;
                                                             }
-                                                            for (client, q) in &listeners {
-                                                                if dsp::lane_of(*q) == *lane {
-                                                                    s.send_pcm(*client, tg, pcm);
+                                                            for l in &listeners {
+                                                                if dsp::key_of(l.sink()) == *key {
+                                                                    s.send_pcm(l.client, tg, pcm);
                                                                 }
                                                             }
                                                         }

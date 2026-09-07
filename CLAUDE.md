@@ -135,6 +135,38 @@ and the platform proxies them - a browser never reaches them directly. Call ids
 are `{epoch}-{tg}-{seq}` and therefore guessable, so the PLATFORM filters both
 the listing and the audio fetch against the caller's own codeplug.
 
+## Rendering, and what a patch sounds like
+
+The rendering belongs to the DESTINATION, not to the speaker. Every listener
+carries a `Sink` - mode, link quality, and whether they are across a patch -
+and `dsp::Talker` renders one transmission once per distinct `Sink`.
+
+A patch is a physical bridge: demodulate one side, re-modulate onto the other.
+So a listener across one has crossed TWO RF hops and hears the artifacts of
+both, which is why patched audio is famously worse than either system alone:
+
+- VHF unit heard on a patched P25 talkgroup: FM hiss at the SPEAKER's link,
+  then vocoded and corrupted at the LISTENER's link. The vocoder trying to
+  model hiss is most of what makes it sound like a patch.
+- P25 unit heard on a patched VHF channel: vocoded at the speaker's link, then
+  band-limited with FM noise on top at the listener's.
+- Nobody across a patch: one hop, as before.
+
+`Router::listeners_across` sets `bridged = member != tg` - the route that was
+keyed versus the route the listener is on. It cannot be worked out any further
+downstream, which is why it rides on the listener.
+
+The bridge hop does NOT run the speaker chain. A patch is a wire, not a
+loudspeaker, and running the saturation and output trim twice sounds like a bad
+recording rather than like a second radio.
+
+Analogue has no decode threshold. A P25 listener below the floor gets nothing
+at all; an FM listener gets noise. That difference is most of what separates
+the two systems and is the whole reason a fireground keeps conventional.
+
+NOT modelled yet: simulcast distortion in the overlap between two transmitters
+of one site. The sites know their transmitters but nothing reports overlap.
+
 ## AM
 
 Conventional routes carry a modulation. FM captures - the stronger signal wins

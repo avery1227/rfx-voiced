@@ -321,8 +321,9 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                                 Err(p) => p.into_inner(),
                             };
                             r.destination_of(client)
+                                .map(|(tg, ls)| (tg, r.source_sink(tg, client), ls))
                         };
-                        let Some((live_tg, listeners)) = dest else {
+                        let Some((live_tg, src, listeners)) = dest else {
                             continue;
                         };
                         if listeners.is_empty() {
@@ -348,9 +349,14 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             }
                         }
 
-                        let qualities: Vec<u8> = listeners.iter().map(|(_, q)| *q).collect();
+                        // A dispatch console has no RF of its own, so its
+                        // source hop is clean - but a listener across a patch
+                        // still gets two hops, and hears the console the way a
+                        // patch device would deliver it.
+                        let sinks: Vec<crate::dsp::Sink> =
+                            listeners.iter().map(|l| l.sink()).collect();
                         let Some(t) = talker.as_mut() else { continue };
-                        let Ok(lanes) = t.push_pcm(&pcm, &qualities) else {
+                        let Ok(lanes) = t.push_pcm(&pcm, src, &sinks) else {
                             continue;
                         };
 
@@ -358,10 +364,13 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             Ok(g) => g,
                             Err(p) => p.into_inner(),
                         };
-                        for (lane, pcm8) in &lanes {
-                            for (c, q) in &listeners {
-                                if crate::dsp::lane_of(*q) == *lane {
-                                    s.send_pcm(*c, live_tg, pcm8);
+                        for (key, pcm8) in &lanes {
+                            if pcm8.is_empty() {
+                                continue;
+                            }
+                            for l in &listeners {
+                                if crate::dsp::key_of(l.sink()) == *key {
+                                    s.send_pcm(l.client, live_tg, pcm8);
                                 }
                             }
                         }

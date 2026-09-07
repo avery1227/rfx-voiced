@@ -314,6 +314,31 @@ impl Agc {
 // in game radio and it destroys the illusion immediately.
 // ---------------------------------------------------------------------------
 
+/// How audio SOUNDS coming out of a route.
+///
+/// The rendering belongs to the destination, not to the speaker. A patch
+/// cross-connects a P25 talkgroup to a VHF channel, and those are not the same
+/// radio system: the P25 side hears a 2400 bps vocoder that freezes when it
+/// loses frames, and the VHF side hears an analogue carrier that hisses. One
+/// transmission has to be rendered both ways at once.
+///
+/// Before this existed everything went through the vocoder, so a VHF set
+/// patched to P25 heard P25 artifacts - which is backwards, and is the one
+/// thing that would give away that the VHF side is not really analogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum Mode {
+    /// Trunked digital. Codec2 standing in for AMBE+2, with bit errors and
+    /// frame erasures.
+    #[default]
+    P25,
+    /// Analogue FM. No vocoder at all - the audio is band-limited and noise is
+    /// added, and it degrades smoothly rather than falling off a cliff.
+    Fm,
+    /// Analogue AM, as on airband. Noisier for the same link, because AM has
+    /// no limiter to throw amplitude noise away.
+    Am,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorProfile {
     /// Probability a whole frame is lost; the decoder repeats the previous one.
@@ -497,162 +522,386 @@ impl Decimator {
 // Lanes
 // ---------------------------------------------------------------------------
 
-/// One quality bucket's decode path. Separate Codec2 decoder state per lane is
-/// required, not an optimisation: a corrupted frame changes decoder state, and
-/// that divergence IS the artifact.
+/// One listener's link, and the rendering it should get.
 ///
-/// Lanes emit raw 8 kHz PCM rather than re-encoded Opus. CEF cannot be relied
-/// on to decode bare Opus packets, and at 8 kHz mono the wire cost is 128 kbps
-/// per talker - cheap enough that adding a codec back would be buying risk
-/// with bandwidth we are not short of.
-struct Lane {
-    decoder: Codec2,
-    previous: Vec<u8>,
-    rng: Rng,
-    /// Per lane, because the filters are stateful and a degraded lane must
-    /// not inherit a clean lane's filter history.
-    speaker: Speaker,
+/// `bridged` is the thing that makes a patch sound like a patch. A patch is a
+/// physical bridge: the audio is DEMODULATED on one side and RE-MODULATED onto
+/// the other, so a listener across one has been through two RF hops, not one,
+/// and the artifacts of both are present. That is why patched audio is
+/// notoriously worse than either system on its own, and why anybody who has
+/// heard a real one recognises it instantly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sink {
+    pub mode: Mode,
+    /// 0..100, where 100 is full quieting.
+    pub quality: u8,
+    /// This listener is on the far side of a patch from the speaker.
+    pub bridged: bool,
 }
 
-impl Lane {
-    fn new(bucket: u8, bits: usize) -> Self {
-        Self {
-            decoder: Codec2::new(codec2_mode()),
-            previous: vec![0u8; bits],
-            rng: Rng(0x9E37_79B9_7F4A_7C15 ^ (bucket as u64).wrapping_mul(0x1234_5678)),
-            speaker: Speaker::new(),
+/// One RF hop: what a transmission sounds like after crossing it.
+///
+/// Separate state per hop is required rather than an optimisation. A corrupted
+/// vocoder frame changes decoder state and that divergence IS the artifact, and
+/// an analogue filter carries history the same way - so a degraded lane must
+/// never inherit a clean lane's.
+///
+/// Hops emit raw 8 kHz PCM rather than re-encoded Opus. CEF cannot be relied on
+/// to decode bare Opus packets, and at 8 kHz mono the wire cost is 128 kbps per
+/// talker - cheap enough that adding a codec back would be buying risk with
+/// bandwidth we are not short of.
+enum Leg {
+    // Boxed: the vocoder state is two Codec2 instances and dwarfs the
+    // analogue variant, so an unboxed enum would make every analogue hop pay
+    // fifteen kilobytes for a struct it does not have.
+    Digital(Box<DigitalLeg>),
+    Analog(AnalogLeg),
+}
+
+impl Leg {
+    /// `output` is false for the middle of a bridge. A patch is a wire, not a
+    /// loudspeaker: running the speaker chain there too would apply its
+    /// saturation and trim twice, which sounds like a bad recording rather
+    /// than like a second radio.
+    fn new(sink: Sink, output: bool, frame_bytes: usize, seed: u64) -> Self {
+        let speaker = output.then(Speaker::new);
+        match sink.mode {
+            Mode::P25 => Leg::Digital(Box::new(DigitalLeg {
+                encoder: Codec2::new(codec2_mode()),
+                decoder: Codec2::new(codec2_mode()),
+                previous: vec![0u8; frame_bytes],
+                packed: vec![0u8; frame_bytes],
+                rng: Rng(0x9E37_79B9_7F4A_7C15 ^ seed),
+                profile: profile(lane_of(sink.quality)),
+                frame_bytes,
+                speaker,
+            })),
+            Mode::Fm | Mode::Am => Leg::Analog(AnalogLeg {
+                rng: Rng(0x8EBC_6AF0_9C88_C6E3 ^ seed),
+                tilt: Biquad::lowpass(RATE as f32, 3400.0, 0.707),
+                mode: sink.mode,
+                noise: analog_noise(sink.quality, sink.mode),
+                speaker,
+            }),
+        }
+    }
+
+    /// Crosses one hop. `frame` is exactly one vocoder frame; the same number
+    /// of samples comes out.
+    fn run(&mut self, frame: &[i16], out: &mut Vec<i16>) {
+        match self {
+            Leg::Digital(d) => d.run(frame, out),
+            Leg::Analog(a) => a.run(frame, out),
         }
     }
 }
 
-/// One talker's chain: shared front end, one lane per quality bucket in use.
+/// A digital hop: vocode, corrupt, decode.
+struct DigitalLeg {
+    encoder: Codec2,
+    decoder: Codec2,
+    previous: Vec<u8>,
+    packed: Vec<u8>,
+    rng: Rng,
+    profile: ErrorProfile,
+    frame_bytes: usize,
+    speaker: Option<Speaker>,
+}
+
+impl DigitalLeg {
+    fn run(&mut self, frame: &[i16], out: &mut Vec<i16>) {
+        self.encoder.encode(&mut self.packed, frame);
+
+        let mut corrupted = self.packed.clone();
+        if self.rng.chance(self.profile.erasure) {
+            // Frame erased: the decoder repeats the previous one. This is
+            // "the freeze", and it is a real P25 artifact.
+            corrupted.copy_from_slice(&self.previous);
+        } else {
+            for _ in 0..self.profile.bit_errors {
+                let bit = self.rng.below((self.frame_bytes * 8) as u32) as usize;
+                corrupted[bit / 8] ^= 1 << (bit % 8);
+            }
+            self.previous.copy_from_slice(&self.packed);
+        }
+
+        let mut pcm = vec![0i16; frame.len()];
+        self.decoder.decode(&mut pcm, &corrupted);
+        if let Some(sp) = self.speaker.as_mut() {
+            sp.run(&mut pcm);
+        }
+        out.extend_from_slice(&pcm);
+    }
+}
+
+/// An analogue hop: band-limit, and bury it in as much noise as the link
+/// deserves.
+///
+/// Nothing here is a vocoder. Analogue radio carries the waveform, so what the
+/// far end produces is what was spoken, filtered by the channel and mixed with
+/// noise. The two things that make it recognisably analogue rather than
+/// "digital with hiss":
+///
+///   * Noise scales smoothly with signal. No decode threshold, no freeze, no
+///     cliff - a marginal FM signal is scratchy and still usable, which is the
+///     entire reason a fireground keeps conventional around.
+///   * FM limits and AM does not. An FM receiver throws amplitude away, so its
+///     noise floor is flat and sits under the voice; AM passes amplitude
+///     straight through, so the noise rides on the signal and is worst exactly
+///     when somebody is talking.
+struct AnalogLeg {
+    rng: Rng,
+    /// Lowpass on the noise itself, so it is a hiss rather than a fizz.
+    tilt: Biquad,
+    mode: Mode,
+    noise: f32,
+    speaker: Option<Speaker>,
+}
+
+impl AnalogLeg {
+    fn run(&mut self, frame: &[i16], out: &mut Vec<i16>) {
+        let mut pcm: Vec<i16> = Vec::with_capacity(frame.len());
+
+        for s in frame {
+            let clean = *s as f32 / 32768.0;
+
+            // Uniform, then filtered. Good enough at this level, and cheaper
+            // than a gaussian nobody could pick out by ear.
+            let raw = ((self.rng.next() >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0;
+            let hiss = self.tilt.run(raw) * self.noise;
+
+            let x = match self.mode {
+                Mode::Fm => clean + hiss,
+                Mode::Am => clean + hiss * (0.6 + clean.abs() * 1.4),
+                Mode::P25 => clean,
+            };
+
+            pcm.push((x.clamp(-1.0, 1.0) * 32767.0) as i16);
+        }
+
+        if let Some(sp) = self.speaker.as_mut() {
+            sp.run(&mut pcm);
+        }
+        out.extend_from_slice(&pcm);
+    }
+}
+
+/// Noise amplitude for a link, 0..1.
+///
+/// Deliberately smooth and deliberately never zero. Full quieting on a real FM
+/// receiver is quiet, not silent, and that residual is most of what tells an
+/// operator the channel is open rather than dead.
+fn analog_noise(quality: u8, mode: Mode) -> f32 {
+    let q = quality.min(100) as f32 / 100.0;
+
+    // Squared, so the top of the range is nearly clean and the bottom falls
+    // apart quickly, which is the shape of the real curve.
+    let base = (1.0 - q).powi(2) * 0.55 + 0.004;
+
+    match mode {
+        // Worse for the same link: no limiter to throw amplitude noise away.
+        Mode::Am => base * 1.6,
+        _ => base,
+    }
+}
+
+/// A stable key for one rendering. Two listeners sharing it hear byte-identical
+/// audio and are served from one pass.
+pub type LegKey = (Mode, u8, bool);
+
+pub fn key_of(sink: Sink) -> LegKey {
+    (sink.mode, lane_of(sink.quality), sink.bridged)
+}
+
+/// One talker's chain: shared front end, one hop per rendering in use.
 pub struct Talker {
     opus_in: opus::Decoder,
     decimator: Decimator,
     highpass: Biquad,
     agc: Agc,
-    encoder: Codec2,
-    /// 8 kHz samples not yet consumed by a whole Codec2 frame.
+    /// 8 kHz samples not yet consumed by a whole vocoder frame.
     pending: Vec<i16>,
-    lanes: HashMap<u8, Lane>,
+    /// The SPEAKER's own hop, rendered once per frame and shared by every
+    /// listener on the far side of a patch. This is the demodulated audio a
+    /// patch device would be feeding into the other system.
+    bridge: Option<(Sink, Leg)>,
+    /// Destination hops, one per rendering actually in use.
+    legs: HashMap<LegKey, Leg>,
+    spf: usize,
     frame_bytes: usize,
 }
 
 impl Talker {
     pub fn new() -> Result<Self> {
-        let encoder = Codec2::new(codec2_mode());
-        let frame_bytes = encoder.bits_per_frame().div_ceil(8);
+        let probe = Codec2::new(codec2_mode());
         Ok(Self {
             // FiveM encodes at 48 kHz mono.
             opus_in: opus::Decoder::new(48000, opus::Channels::Mono)?,
             decimator: Decimator::new(),
-            // 300 Hz: below the voice band, and rumble the vocoder would
+            // 300 Hz: below the voice band, and rumble a vocoder would
             // otherwise waste parameters modelling.
             highpass: Biquad::highpass(RATE as f32, 300.0, 0.707),
             agc: Agc::new(),
-            encoder,
             pending: Vec::with_capacity(FRAME * 4),
-            lanes: HashMap::new(),
-            frame_bytes,
+            bridge: None,
+            legs: HashMap::new(),
+            spf: probe.samples_per_frame(),
+            frame_bytes: probe.bits_per_frame().div_ceil(8),
         })
     }
 
-    /// Feeds one Opus packet from the tap and returns, for each requested
-    /// bucket, the 8 kHz PCM to deliver to listeners in that bucket.
+    /// Feeds one Opus packet from the tap and returns the PCM for each
+    /// rendering in use.
     ///
-    /// A bucket that is muted (5) produces nothing at all - not silence
-    /// samples, nothing - because that is what a receiver below threshold does.
-    /// `qualities` are 0..100 link-quality values, one per listener. They are
-    /// grouped to lanes internally, so passing forty is fine.
-    pub fn push(&mut self, opus_packet: &[u8], qualities: &[u8]) -> Result<Vec<(u8, Vec<i16>)>> {
+    /// `src` is the SPEAKER's own link and the mode of the route they keyed;
+    /// `sinks` is one entry per listener. Listeners are grouped internally, so
+    /// passing forty is fine.
+    ///
+    /// A P25 listener below the decode threshold produces nothing at all - not
+    /// silence samples, nothing - because that is what a receiver below
+    /// threshold does. An analogue listener always produces something, because
+    /// analogue has no threshold: a bad FM signal is noise, not absence, and
+    /// that difference is most of what separates the two systems.
+    pub fn push(
+        &mut self,
+        opus_packet: &[u8],
+        src: Sink,
+        sinks: &[Sink],
+    ) -> Result<Vec<(LegKey, Vec<i16>)>> {
         // 48 kHz mono, worst case 60 ms.
         let mut wide = vec![0i16; 48000 * 60 / 1000];
         let n = self.opus_in.decode(opus_packet, &mut wide, false)?;
         wide.truncate(n);
 
-        self.push_wide(&wide, qualities)
+        self.push_wide(&wide, src, sinks)
     }
 
     /// The same chain, fed 48 kHz PCM directly.
     ///
     /// A dispatch console has no Opus in the path: the browser captures at the
     /// device rate and sends samples, so decoding would mean encoding first,
-    /// purely to decode it again. Everything downstream - decimate, high-pass,
-    /// AGC, vocoder, the speaker chain - is the same code, so a console and a
-    /// radio sound like the same network rather than like two systems.
-    pub fn push_pcm(&mut self, wide: &[i16], qualities: &[u8]) -> Result<Vec<(u8, Vec<i16>)>> {
-        self.push_wide(wide, qualities)
+    /// purely to decode it again. Everything downstream is the same code, so a
+    /// console and a radio sound like the same network rather than like two
+    /// systems.
+    pub fn push_pcm(
+        &mut self,
+        wide: &[i16],
+        src: Sink,
+        sinks: &[Sink],
+    ) -> Result<Vec<(LegKey, Vec<i16>)>> {
+        self.push_wide(wide, src, sinks)
     }
 
-    fn push_wide(&mut self, wide: &[i16], qualities: &[u8]) -> Result<Vec<(u8, Vec<i16>)>> {
+    fn push_wide(
+        &mut self,
+        wide: &[i16],
+        src: Sink,
+        sinks: &[Sink],
+    ) -> Result<Vec<(LegKey, Vec<i16>)>> {
         self.decimator.push(wide, &mut self.pending);
 
-        let spf = self.encoder.samples_per_frame();
-        let mut out: Vec<(u8, Vec<i16>)> = Vec::new();
-        for &q in qualities {
-            let lane = lane_of(q);
-            if !profile(lane).muted && !out.iter().any(|(x, _)| *x == lane) {
-                out.push((lane, Vec::new()));
+        let mut out: Vec<(LegKey, Vec<i16>)> = Vec::new();
+        for s in sinks {
+            // Only digital has a threshold below which nothing arrives.
+            if s.mode == Mode::P25 && profile(lane_of(s.quality)).muted {
+                continue;
+            }
+            let key = key_of(*s);
+            if !out.iter().any(|(k, _)| *k == key) {
+                out.push((key, Vec::new()));
             }
         }
+
         if out.is_empty() {
             // Nobody to serve; still drain so state does not grow unbounded.
-            while self.pending.len() >= spf {
-                self.pending.drain(..spf);
+            while self.pending.len() >= self.spf {
+                self.pending.drain(..self.spf);
             }
             return Ok(out);
         }
 
-        let mut packed = vec![0u8; self.frame_bytes];
-        let mut pcm = vec![0i16; spf];
+        // The bridge is built only when somebody is actually across one, and
+        // rebuilt when the speaker's own link changes bucket - its error state
+        // belongs to one link, not to a talkspurt.
+        let need_bridge = out.iter().any(|((_, _, bridged), _)| *bridged);
+        if need_bridge {
+            let stale = match &self.bridge {
+                Some((have, _)) => key_of(*have) != key_of(src),
+                None => true,
+            };
+            if stale {
+                self.bridge = Some((src, Leg::new(src, false, self.frame_bytes, seed_of(src, 1))));
+            }
+        }
 
-        let mut work = vec![0f32; spf];
+        let mut work = vec![0f32; self.spf];
+        let mut bridged_frame: Vec<i16> = Vec::with_capacity(self.spf);
 
-        while self.pending.len() >= spf {
-            let raw: Vec<i16> = self.pending.drain(..spf).collect();
+        while self.pending.len() >= self.spf {
+            let raw: Vec<i16> = self.pending.drain(..self.spf).collect();
 
-            // Condition BEFORE the vocoder. A low-rate vocoder resynthesises
-            // from parameters, so anything it should not be modelling - rumble,
-            // an inconsistent level - costs quality across the whole frame.
+            // Condition BEFORE anything else. A low-rate vocoder resynthesises
+            // from parameters, so rumble or an inconsistent level costs quality
+            // across the whole frame - and an analogue hop would carry them
+            // through untouched.
             for (w, r) in work.iter_mut().zip(raw.iter()) {
                 *w = self.highpass.run(*r as f32);
             }
             self.agc.run(&mut work);
+            let clean: Vec<i16> = work.iter().map(|s| *s as i16).collect();
 
-            let frame: Vec<i16> = work.iter().map(|s| *s as i16).collect();
-            self.encoder.encode(&mut packed, &frame);
-
-            for (quality, pcm_out) in out.iter_mut() {
-                let p = profile(*quality);
-                let bits = self.frame_bytes;
-
-                let lane = self
-                    .lanes
-                    .entry(*quality)
-                    .or_insert_with(|| Lane::new(*quality, bits));
-
-                let mut corrupted = packed.clone();
-
-                if lane.rng.chance(p.erasure) {
-                    // Frame erased: the decoder repeats the previous frame.
-                    // This is "the freeze", and it is a real P25 artifact.
-                    corrupted.copy_from_slice(&lane.previous);
-                } else {
-                    for _ in 0..p.bit_errors {
-                        let bit = lane.rng.below((bits * 8) as u32) as usize;
-                        corrupted[bit / 8] ^= 1 << (bit % 8);
-                    }
-                    lane.previous.copy_from_slice(&packed);
+            // The speaker's own hop, once. This is what a patch device hears
+            // and re-modulates: a VHF unit's audio arrives at the patch with
+            // its hiss already on it, and that hiss then goes through the P25
+            // vocoder - which is exactly why patched audio sounds worse than
+            // either side alone.
+            bridged_frame.clear();
+            if need_bridge {
+                if let Some((_, leg)) = self.bridge.as_mut() {
+                    leg.run(&clean, &mut bridged_frame);
                 }
+            }
 
-                lane.decoder.decode(&mut pcm, &corrupted);
-                lane.speaker.run(&mut pcm);
-                pcm_out.extend_from_slice(&pcm);
+            for (key, pcm_out) in out.iter_mut() {
+                let (mode, lane, bridged) = *key;
+                let input = if bridged { &bridged_frame } else { &clean };
+
+                let leg = self.legs.entry(*key).or_insert_with(|| {
+                    Leg::new(
+                        Sink {
+                            mode,
+                            quality: lane,
+                            bridged,
+                        },
+                        true,
+                        self.frame_bytes,
+                        seed_of(
+                            Sink {
+                                mode,
+                                quality: lane,
+                                bridged,
+                            },
+                            2,
+                        ),
+                    )
+                });
+                leg.run(input, pcm_out);
             }
         }
 
         Ok(out)
     }
+}
+
+/// Seeds the noise and error streams. Per rendering, so two listeners on the
+/// same link do not hear bit-identical noise - which reads as a recording
+/// rather than as radio - and stable, so one listener's hiss does not restart
+/// every frame.
+fn seed_of(sink: Sink, salt: u64) -> u64 {
+    (sink.quality as u64).wrapping_mul(0x1234_5678)
+        ^ ((sink.mode as u64) << 40)
+        ^ ((sink.bridged as u64) << 48)
+        ^ salt.wrapping_mul(0x9E37_79B9)
 }
 
 #[cfg(test)]
@@ -741,20 +990,34 @@ mod tests {
         );
     }
 
+    /// A P25 subscriber on their own talkgroup: one hop, no bridge.
+    fn p25(quality: u8) -> Sink {
+        Sink {
+            mode: Mode::P25,
+            quality,
+            bridged: false,
+        }
+    }
+
+    fn opus_40ms(enc: &mut opus::Encoder) -> Result<Vec<u8>> {
+        let pcm = tone_48k(40);
+        let mut packet = vec![0u8; 4000];
+        let len = enc.encode(&pcm, &mut packet)?;
+        packet.truncate(len);
+        Ok(packet)
+    }
+
     #[test]
     fn full_quieting_produces_audio_and_below_threshold_produces_none() -> Result<()> {
         let mut t = Talker::new()?;
         let mut encoder = opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip)?;
-        let pcm = tone_48k(40);
-        let mut packet = vec![0u8; 4000];
-        let len = encoder.encode(&pcm, &mut packet)?;
-        packet.truncate(len);
+        let packet = opus_40ms(&mut encoder)?;
 
-        let out = t.push(&packet, &[100, 0])?;
+        let out = t.push(&packet, p25(100), &[p25(100), p25(0)])?;
 
         let clean = out
             .iter()
-            .find(|(q, _)| *q == 100)
+            .find(|((_, lane, _), _)| *lane == 100)
             .expect("quality 100 is served");
         assert_eq!(
             clean.1.len(),
@@ -764,7 +1027,7 @@ mod tests {
         assert!(clean.1.iter().any(|s| *s != 0), "and it is not silence");
 
         assert!(
-            out.iter().all(|(q, _)| *q != 0),
+            out.iter().all(|((_, lane, _), _)| *lane != 0),
             "below the decode floor delivers nothing at all - silence, not noise"
         );
         Ok(())
@@ -777,14 +1040,10 @@ mod tests {
         let mut differed = false;
 
         for _ in 0..25 {
-            let pcm = tone_48k(40);
-            let mut packet = vec![0u8; 4000];
-            let len = encoder.encode(&pcm, &mut packet)?;
-            packet.truncate(len);
-
-            let out = t.push(&packet, &[100, 30])?;
-            let clean = &out.iter().find(|(q, _)| *q == 100).unwrap().1;
-            let rough = &out.iter().find(|(q, _)| *q == 30).unwrap().1;
+            let packet = opus_40ms(&mut encoder)?;
+            let out = t.push(&packet, p25(100), &[p25(100), p25(30)])?;
+            let clean = &out.iter().find(|((_, l, _), _)| *l == 100).unwrap().1;
+            let rough = &out.iter().find(|((_, l, _), _)| *l == 30).unwrap().1;
             if clean != rough {
                 differed = true;
                 break;
@@ -796,6 +1055,127 @@ mod tests {
             "quality 30 must not sound identical to quality 100"
         );
         Ok(())
+    }
+
+    // -- Patching between systems ------------------------------------------
+
+    #[test]
+    fn analogue_has_no_decode_threshold() -> Result<()> {
+        let mut t = Talker::new()?;
+        let mut encoder = opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip)?;
+        let packet = opus_40ms(&mut encoder)?;
+
+        let fm = Sink {
+            mode: Mode::Fm,
+            quality: 0,
+            bridged: false,
+        };
+        let out = t.push(&packet, fm, &[fm])?;
+
+        // The P25 side of the same link gets nothing at all. FM gets noise,
+        // because that is the difference between the two systems and the whole
+        // reason a fireground keeps conventional around.
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.iter().any(|s| *s != 0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_patched_listener_is_rendered_for_their_own_system() -> Result<()> {
+        let mut t = Talker::new()?;
+        let mut encoder = opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip)?;
+        let packet = opus_40ms(&mut encoder)?;
+
+        // A VHF unit talking, heard by another VHF set on the same channel and
+        // by a P25 subscriber across a patch.
+        let src = Sink {
+            mode: Mode::Fm,
+            quality: 80,
+            bridged: false,
+        };
+        let out = t.push(
+            &packet,
+            src,
+            &[
+                src,
+                Sink {
+                    mode: Mode::P25,
+                    quality: 80,
+                    bridged: true,
+                },
+            ],
+        )?;
+
+        assert_eq!(out.len(), 2, "two systems, two renderings");
+        let direct = out.iter().find(|((m, _, _), _)| *m == Mode::Fm).unwrap();
+        let patched = out.iter().find(|((m, _, _), _)| *m == Mode::P25).unwrap();
+
+        assert!(patched.0 .2, "the P25 side crossed a bridge");
+        assert_ne!(
+            direct.1, patched.1,
+            "the same audio must not be delivered to both sides unchanged"
+        );
+        assert_eq!(direct.1.len(), patched.1.len());
+        Ok(())
+    }
+
+    #[test]
+    fn crossing_a_patch_costs_more_than_staying_put() -> Result<()> {
+        let mut t = Talker::new()?;
+        let mut encoder = opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip)?;
+
+        // Two P25 subscribers on the same excellent link. One is on the
+        // talkgroup that was keyed; the other is across a patch from a VHF
+        // channel, so their audio went through an analogue hop before the
+        // vocoder ever saw it.
+        let src = Sink {
+            mode: Mode::Fm,
+            quality: 100,
+            bridged: false,
+        };
+        let direct_sink = Sink {
+            mode: Mode::Fm,
+            quality: 100,
+            bridged: false,
+        };
+        let patched_sink = Sink {
+            mode: Mode::P25,
+            quality: 100,
+            bridged: true,
+        };
+
+        let mut differed = false;
+        for _ in 0..10 {
+            let packet = opus_40ms(&mut encoder)?;
+            let out = t.push(&packet, src, &[direct_sink, patched_sink])?;
+            let a = &out.iter().find(|((m, _, _), _)| *m == Mode::Fm).unwrap().1;
+            let b = &out.iter().find(|((m, _, _), _)| *m == Mode::P25).unwrap().1;
+            if a != b {
+                differed = true;
+                break;
+            }
+        }
+
+        assert!(
+            differed,
+            "a patched listener hears the extra hop, not a clean copy"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn am_is_noisier_than_fm_on_the_same_link() {
+        for q in [20u8, 60, 90] {
+            assert!(
+                analog_noise(q, Mode::Am) > analog_noise(q, Mode::Fm),
+                "AM has no limiter to throw amplitude noise away (quality {q})"
+            );
+        }
+        assert!(
+            analog_noise(100, Mode::Fm) > 0.0,
+            "full quieting is quiet, not silent - the residual is how an \
+             operator knows the channel is open rather than dead"
+        );
     }
 }
 
@@ -826,14 +1206,14 @@ pub struct AmMix {
     /// Pending samples per (lane, talker). Lanes are kept apart because a
     /// listener on a bad link and one on a good link are hearing different
     /// renderings of the same collision.
-    queues: HashMap<(u8, u32), VecDeque<i16>>,
+    queues: HashMap<(LegKey, u32), VecDeque<i16>>,
     /// When each talker last contributed anything.
     seen: HashMap<u32, Instant>,
     phase: f32,
 }
 
 impl AmMix {
-    pub fn add(&mut self, lane: u8, talker: u32, pcm: &[i16], now: Instant) {
+    pub fn add(&mut self, lane: LegKey, talker: u32, pcm: &[i16], now: Instant) {
         self.seen.insert(talker, now);
         self.queues
             .entry((lane, talker))
@@ -847,12 +1227,12 @@ impl AmMix {
     /// whoever is left, and discarding them clips their first word after the
     /// other radio let go - which is exactly the word somebody was straining
     /// to hear through the mess.
-    pub fn flush(&mut self) -> Vec<(u8, Vec<i16>)> {
-        let mut lanes: Vec<u8> = self.queues.keys().map(|(lane, _)| *lane).collect();
+    pub fn flush(&mut self) -> Vec<(LegKey, Vec<i16>)> {
+        let mut lanes: Vec<LegKey> = self.queues.keys().map(|(lane, _)| *lane).collect();
         lanes.sort_unstable();
         lanes.dedup();
 
-        let mut out: Vec<(u8, Vec<i16>)> = Vec::new();
+        let mut out: Vec<(LegKey, Vec<i16>)> = Vec::new();
         for lane in lanes {
             let talkers: Vec<u32> = self
                 .queues
@@ -894,20 +1274,20 @@ impl AmMix {
     /// Self-clocking off whoever is transmitting: a frame comes out as soon as
     /// the last contributor supplies its share, so the mix drifts by at most
     /// one frame behind the slowest radio.
-    pub fn drain(&mut self, now: Instant) -> Vec<(u8, Vec<i16>)> {
+    pub fn drain(&mut self, now: Instant) -> Vec<(LegKey, Vec<i16>)> {
         // Whoever has stopped is no longer waited for.
         self.seen
             .retain(|_, at| now.duration_since(*at).as_millis() as u64 <= AM_GONE_MS);
         self.queues.retain(|(_, t), _| self.seen.contains_key(t));
 
-        let lanes: Vec<u8> = {
-            let mut v: Vec<u8> = self.queues.keys().map(|(lane, _)| *lane).collect();
+        let lanes: Vec<LegKey> = {
+            let mut v: Vec<LegKey> = self.queues.keys().map(|(lane, _)| *lane).collect();
             v.sort_unstable();
             v.dedup();
             v
         };
 
-        let mut out: Vec<(u8, Vec<i16>)> = Vec::new();
+        let mut out: Vec<(LegKey, Vec<i16>)> = Vec::new();
 
         for lane in lanes {
             let talkers: Vec<u32> = self
@@ -969,6 +1349,13 @@ const AM_BEAT_HZ: f32 = 620.0;
 mod am_tests {
     use super::*;
 
+    /// One AM rendering. The mixer keys on the whole rendering, not on a bare
+    /// lane: an AM listener across a patch and one on the channel itself hear
+    /// different things and must not be summed into each other.
+    fn am(lane: u8) -> LegKey {
+        (Mode::Am, lane, false)
+    }
+
     fn tone(n: usize, v: i16) -> Vec<i16> {
         vec![v; n]
     }
@@ -978,10 +1365,10 @@ mod am_tests {
         let mut mix = AmMix::default();
         let now = Instant::now();
 
-        mix.add(0, 1, &tone(80, 100), now);
+        mix.add(am(0), 1, &tone(80, 100), now);
         assert!(mix.drain(now).is_empty(), "half a frame is not a frame");
 
-        mix.add(0, 1, &tone(80, 100), now);
+        mix.add(am(0), 1, &tone(80, 100), now);
         let out = mix.drain(now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1.len(), AM_FRAME);
@@ -996,17 +1383,17 @@ mod am_tests {
         // first frame of a collision goes out on its own. One frame - 20 ms -
         // and it is what actually happens anyway: the second radio keyed a
         // moment after the first.
-        mix.add(0, 1, &tone(AM_FRAME, 1000), now);
+        mix.add(am(0), 1, &tone(AM_FRAME, 1000), now);
         assert_eq!(mix.drain(now).len(), 1);
 
         // From here both are known, and neither is emitted alone.
-        mix.add(0, 2, &tone(AM_FRAME, 2000), now);
+        mix.add(am(0), 2, &tone(AM_FRAME, 2000), now);
         assert!(
             mix.drain(now).is_empty(),
             "the other radio has not supplied its share yet, and emitting this              frame now would be interleaving rather than mixing"
         );
 
-        mix.add(0, 1, &tone(AM_FRAME, 1000), now);
+        mix.add(am(0), 1, &tone(AM_FRAME, 1000), now);
         let out = mix.drain(now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1.len(), AM_FRAME);
@@ -1030,7 +1417,7 @@ mod am_tests {
         let mut mix = AmMix::default();
         let now = Instant::now();
 
-        for lane in [0u8, 2] {
+        for lane in [am(0), am(2)] {
             mix.add(lane, 1, &tone(AM_FRAME, 500), now);
             mix.add(lane, 2, &tone(AM_FRAME, 500), now);
         }
@@ -1041,8 +1428,8 @@ mod am_tests {
             2,
             "a bad link and a good one are different mixes"
         );
-        assert_eq!(out[0].0, 0);
-        assert_eq!(out[1].0, 2);
+        assert_eq!(out[0].0, am(0));
+        assert_eq!(out[1].0, am(2));
     }
 
     #[test]
@@ -1050,14 +1437,14 @@ mod am_tests {
         let mut mix = AmMix::default();
         let start = Instant::now();
 
-        mix.add(0, 1, &tone(AM_FRAME, 1000), start);
-        mix.add(0, 2, &tone(AM_FRAME * 2, 1000), start);
+        mix.add(am(0), 1, &tone(AM_FRAME, 1000), start);
+        mix.add(am(0), 2, &tone(AM_FRAME * 2, 1000), start);
         assert_eq!(mix.drain(start).len(), 1);
 
         // Talker 1 let go. Talker 2 must not be stuck holding a frame waiting
         // for samples that are never coming.
         let later = start + std::time::Duration::from_millis(AM_GONE_MS + 20);
-        mix.add(0, 2, &tone(AM_FRAME, 1000), later);
+        mix.add(am(0), 2, &tone(AM_FRAME, 1000), later);
         let out = mix.drain(later);
         assert_eq!(out.len(), 1);
         assert!(out[0].1.len() >= AM_FRAME);
@@ -1068,7 +1455,7 @@ mod am_tests {
         let mut mix = AmMix::default();
         let now = Instant::now();
 
-        mix.add(0, 1, &tone(90, 1000), now);
+        mix.add(am(0), 1, &tone(90, 1000), now);
         let out = mix.flush();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1.len(), 90, "a partial frame still gets heard");

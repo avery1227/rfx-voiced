@@ -66,6 +66,35 @@ pub struct Member {
     pub quality: u8,
 }
 
+/// Who hears a transmission, and how it should SOUND to them.
+///
+/// A patch cross-connects a trunked talkgroup to a VHF channel, and the two
+/// sides are not the same radio system. A P25 subscriber hears a vocoder; a
+/// VHF set hears an analogue carrier with noise on it. Carrying the mode with
+/// the listener is what lets one transmission be rendered both ways, which is
+/// the whole point of a patch and was previously not done at all - everybody
+/// got the speaker's own rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listener {
+    pub client: ClientId,
+    /// 0..100, where 100 is full quieting.
+    pub quality: u8,
+    pub mode: crate::dsp::Mode,
+    /// On the far side of a patch from the speaker, and so two RF hops
+    /// away rather than one.
+    pub bridged: bool,
+}
+
+impl Listener {
+    pub fn sink(&self) -> crate::dsp::Sink {
+        crate::dsp::Sink {
+            mode: self.mode,
+            quality: self.quality,
+            bridged: self.bridged,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Route {
     pub encrypted: bool,
@@ -90,6 +119,18 @@ pub struct Route {
     /// Only ever populated on an AM route. Everywhere else a route has exactly
     /// one holder by construction, and this stays empty.
     pub also: Vec<ClientId>,
+}
+
+impl Route {
+    fn mode(&self) -> crate::dsp::Mode {
+        match (self.conventional, self.am) {
+            (true, true) => crate::dsp::Mode::Am,
+            (true, false) => crate::dsp::Mode::Fm,
+            // Trunked. AM on a trunked route is meaningless and is ignored
+            // rather than treated as a third thing.
+            _ => crate::dsp::Mode::P25,
+        }
+    }
 }
 
 /// What happened to a key request. Preemption carries whoever was cut off, so
@@ -319,7 +360,7 @@ impl Router {
     /// is looked up by identity instead. The ROUTER decides what it is keyed
     /// to; the client saying so in a frame would let a position transmit on a
     /// talkgroup it never asked for and was never granted.
-    pub fn destination_of(&self, speaker: ClientId) -> Option<(u32, Vec<(ClientId, u8)>)> {
+    pub fn destination_of(&self, speaker: ClientId) -> Option<(u32, Vec<Listener>)> {
         // Prefer the route they asked for. Scanning for a holder finds any
         // member of a patch group, and `routes` is a HashMap - so which member
         // it found changed between runs, and with it the talkgroup announced
@@ -346,6 +387,67 @@ impl Router {
             .is_some_and(|r| r.keyed == Some(client) || r.also.contains(&client))
     }
 
+    /// Given a speaking Mumble session: the route it is keyed into, that
+    /// speaker's own hop, and who should receive it.
+    ///
+    /// An empty listener list means the audio goes nowhere - which is the
+    /// correct and common case, because most speech is proximity chat rather
+    /// than radio.
+    pub fn destination(
+        &self,
+        session: SessionId,
+    ) -> Option<(u32, crate::dsp::Sink, Vec<Listener>)> {
+        let speaker = self.client_of(session)?;
+        let (tg, listeners) = self.destination_of(speaker)?;
+        Some((tg, self.source_sink(tg, speaker), listeners))
+    }
+
+    /// The SPEAKER's own hop: the mode of the route they keyed and their own
+    /// link on it.
+    ///
+    /// This is the first half of a patch. A VHF unit's audio reaches the patch
+    /// device with its hiss already on it, and that hiss is then re-modulated
+    /// onto the other system - so the far side hears noise that has been
+    /// through a vocoder, which is exactly what a real patch sounds like.
+    pub fn source_sink(&self, tg: u32, speaker: ClientId) -> crate::dsp::Sink {
+        let route = self.routes.get(&tg);
+        crate::dsp::Sink {
+            mode: route.map(Route::mode).unwrap_or_default(),
+            // Full quieting when the route does not list them, which is the
+            // console case: a dispatch position has no RF path to degrade.
+            quality: route
+                .and_then(|r| r.members.get(&speaker))
+                .map(|m| m.quality)
+                .unwrap_or(100),
+            bridged: false,
+        }
+    }
+    /// Whether a collision is in progress anywhere in this route's patch
+    /// group on an AM member.
+    ///
+    /// Across the GROUP, not just the keyed route: two people doubling onto a
+    /// patched airband channel are doubling on it whichever side they keyed
+    /// from, and checking only the originating route missed exactly that.
+    pub fn am_collision(&self, tg: u32) -> bool {
+        let group = self.joined(tg);
+        if !group
+            .iter()
+            .any(|t| self.routes.get(t).is_some_and(|r| r.am))
+        {
+            return false;
+        }
+
+        let mut talkers: Vec<ClientId> = Vec::new();
+        for t in group {
+            for who in self.talkers_on(t) {
+                if !talkers.contains(&who) {
+                    talkers.push(who);
+                }
+            }
+        }
+        talkers.len() > 1
+    }
+
     /// Everybody transmitting on a route at once. One person normally; more
     /// only on AM, where that is the whole point.
     pub fn talkers_on(&self, tg: u32) -> Vec<ClientId> {
@@ -361,8 +463,8 @@ impl Router {
     ///
     /// Deduplicated: somebody affiliated to two patched talkgroups is one
     /// person and must not be sent the same audio twice.
-    fn listeners_across(&self, tg: u32, except: Option<ClientId>) -> Vec<(ClientId, u8)> {
-        let mut out: Vec<(ClientId, u8)> = Vec::new();
+    fn listeners_across(&self, tg: u32, except: Option<ClientId>) -> Vec<Listener> {
+        let mut out: Vec<Listener> = Vec::new();
 
         for member in self.joined(tg) {
             let Some(route) = self.routes.get(&member) else {
@@ -372,14 +474,37 @@ impl Router {
                 if !m.listen || Some(c) == except {
                     continue;
                 }
-                match out.iter_mut().find(|(x, _)| *x == c) {
+
+                let mode = route.mode();
+                // A patch is a physical bridge - demodulate one side,
+                // re-modulate onto the other - so anybody NOT on the route
+                // that was keyed has crossed two RF hops rather than one. That
+                // is what makes patched audio sound the way it does, and it
+                // cannot be worked out any further downstream.
+                let bridged = member != tg;
+
+                match out.iter_mut().find(|x| x.client == c) {
                     // The better link wins: hearing it once, as well as they
-                    // can, is the right answer.
-                    Some((_, q)) => *q = (*q).max(m.quality),
-                    None => out.push((c, m.quality)),
+                    // can, is the right answer. Mode and bridging follow the
+                    // link that won, because that is the route they are
+                    // actually being served on.
+                    Some(existing) => {
+                        if m.quality > existing.quality {
+                            existing.quality = m.quality;
+                            existing.mode = mode;
+                            existing.bridged = bridged;
+                        }
+                    }
+                    None => out.push(Listener {
+                        client: c,
+                        quality: m.quality,
+                        mode,
+                        bridged,
+                    }),
                 }
             }
         }
+
         out
     }
 
@@ -468,18 +593,6 @@ impl Router {
     }
 
     // -- the hot path -------------------------------------------------------
-
-    /// Given a speaking Mumble session, which talkgroup is it keyed into and
-    /// who should receive it.
-    ///
-    /// Returns the talkgroup and the listeners as (player id, quality). An
-    /// empty result means the audio goes nowhere - which is the correct and
-    /// common case, because most speech is proximity chat, not radio.
-    pub fn destination(&self, session: SessionId) -> Option<(u32, Vec<(ClientId, u8)>)> {
-        let speaker = self.client_of(session)?;
-        self.destination_of(speaker)
-    }
-
     /// Per-server counts for the platform heartbeat: bound identities, distinct
     /// affiliated clients, and how many talkgroups that server is currently
     /// keying. Cheap enough to run on a slow timer, and it is the only
@@ -578,9 +691,12 @@ mod tests {
         r.set_member(1001, cli(B, 3), true, 100);
         r.key(1001, cli(A, 3)).unwrap();
 
-        let (_, listeners) = r.destination(sess(A, 7)).unwrap();
+        let (_, _, listeners) = r.destination(sess(A, 7)).unwrap();
         assert_eq!(
-            listeners,
+            listeners
+                .iter()
+                .map(|l| (l.client, l.quality))
+                .collect::<Vec<_>>(),
             vec![(cli(B, 3), 100)],
             "the speaker is excluded, their namesake on another server is not"
         );
@@ -596,10 +712,13 @@ mod tests {
         assert!(r.destination(sess(A, 3)).is_none(), "no grant, no route");
 
         r.key(1001, cli(A, 5)).unwrap();
-        let (tg, listeners) = r.destination(sess(A, 3)).expect("keyed speech routes");
+        let (tg, _, listeners) = r.destination(sess(A, 3)).expect("keyed speech routes");
         assert_eq!(tg, 1001);
         assert_eq!(
-            listeners,
+            listeners
+                .iter()
+                .map(|l| (l.client, l.quality))
+                .collect::<Vec<_>>(),
             vec![(cli(A, 9), 100)],
             "the speaker is not a listener"
         );
@@ -614,7 +733,7 @@ mod tests {
         r.set_member(9001, cli(A, 9), false, 100); // no key for the encrypted talkgroup
         r.key(9001, cli(A, 5)).unwrap();
 
-        let (_, listeners) = r.destination(sess(A, 3)).unwrap();
+        let (_, _, listeners) = r.destination(sess(A, 3)).unwrap();
         assert!(
             listeners.is_empty(),
             "an unentitled member is never sent audio"
@@ -757,7 +876,7 @@ mod tests {
         for who in [a, b] {
             let (tg, listeners) = r.destination_of(who).expect("both reach the frequency");
             assert_eq!(tg, 0x8000_1234);
-            assert!(listeners.iter().any(|(c, _)| *c == ClientId::new(1, 9)));
+            assert!(listeners.iter().any(|l| l.client == ClientId::new(1, 9)));
         }
         assert_eq!(r.talkers_on(0x8000_1234).len(), 2);
     }
@@ -799,9 +918,69 @@ mod tests {
         let (tg, listeners) = r.destination_of(a).expect("keyed");
         assert_eq!(tg, 1001);
         assert!(
-            listeners.iter().any(|(c, _)| *c == b),
+            listeners.iter().any(|l| l.client == b),
             "somebody on the patched talkgroup hears it"
         );
+    }
+
+    #[test]
+    fn a_patch_between_systems_renders_each_side_for_itself() {
+        let mut r = Router::default();
+        r.open(1001, false);
+        r.open_conventional(0x8000_1234, false);
+        r.set_patches(vec![vec![1001, 0x8000_1234]]);
+
+        let talking = ClientId::new(1, 1);
+        let on_p25 = ClientId::new(1, 2);
+        let on_vhf = ClientId::new(1, 3);
+
+        r.set_member(1001, talking, true, 90);
+        r.set_member(1001, on_p25, true, 90);
+        r.set_member(0x8000_1234, on_vhf, true, 90);
+
+        r.key(1001, talking).unwrap();
+        let (tg, listeners) = r.destination_of(talking).expect("keyed");
+        let src = r.source_sink(tg, talking);
+
+        assert_eq!(tg, 1001);
+        assert_eq!(src.mode, crate::dsp::Mode::P25, "they keyed a talkgroup");
+
+        let p25 = listeners.iter().find(|l| l.client == on_p25).unwrap();
+        let vhf = listeners.iter().find(|l| l.client == on_vhf).unwrap();
+
+        assert_eq!(p25.mode, crate::dsp::Mode::P25);
+        assert!(!p25.bridged, "same route, one hop");
+
+        // The whole point: the VHF side is rendered as VHF, and is marked as
+        // having crossed a bridge so it gets the second hop too.
+        assert_eq!(vhf.mode, crate::dsp::Mode::Fm);
+        assert!(vhf.bridged, "across a patch is two hops, not one");
+    }
+
+    #[test]
+    fn doubling_onto_a_patched_am_channel_is_still_a_collision() {
+        let mut r = Router::default();
+        r.open(1001, false);
+        r.open_conventional(0x8000_5678, true);
+        r.set_patches(vec![vec![1001, 0x8000_5678]]);
+
+        let a = ClientId::new(1, 1);
+        let b = ClientId::new(1, 2);
+        r.set_member(1001, a, true, 90);
+        r.set_member(0x8000_5678, b, true, 90);
+
+        r.key(1001, a).unwrap();
+        assert!(
+            !r.am_collision(1001),
+            "one talker is not a collision, patched or otherwise"
+        );
+
+        // Keying the AM side of the patch. The trunked side already holds the
+        // group, so this is a second transmitter on the same airband channel -
+        // which is exactly the case that checking only the keyed route missed.
+        r.key(0x8000_5678, b).unwrap();
+        assert!(r.am_collision(1001));
+        assert!(r.am_collision(0x8000_5678));
     }
 
     #[test]
@@ -839,7 +1018,7 @@ mod tests {
 
         r.key(1, speaker).unwrap();
         let (_, listeners) = r.destination_of(speaker).expect("keyed");
-        assert!(listeners.iter().any(|(c, _)| *c == far));
+        assert!(listeners.iter().any(|l| l.client == far));
     }
 
     #[test]
@@ -858,9 +1037,12 @@ mod tests {
         r.key(1001, speaker).unwrap();
         let (_, listeners) = r.destination_of(speaker).expect("keyed");
 
-        assert_eq!(listeners.iter().filter(|(c, _)| *c == both).count(), 1);
+        assert_eq!(listeners.iter().filter(|l| l.client == both).count(), 1);
         assert_eq!(
-            listeners.iter().find(|(c, _)| *c == both).map(|(_, q)| *q),
+            listeners
+                .iter()
+                .find(|l| l.client == both)
+                .map(|l| l.quality),
             Some(90),
             "the better link wins - they hear it once, as well as they can"
         );
