@@ -8,6 +8,7 @@
 //! endpoints. If this ever needs to face anything but FXServer, replace it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -24,11 +25,22 @@ pub type Shared = Arc<Mutex<Router>>;
 /// restart.
 pub type SharedKeys = Arc<Mutex<KeyIndex>>;
 
+/// Consoles live on server 0.
+///
+/// Enrolled servers are numbered from 1 - the local store's next_id starts
+/// there and so does the platform's autoincrement - so 0 can never collide
+/// with a real world. Past that the router does not need to know a console is
+/// not a radio: it is a member of talkgroups, it listens, and it can key.
+pub const CONSOLE_SERVER: u32 = 0;
+
+static NEXT_CONSOLE: AtomicU32 = AtomicU32::new(1);
+
 pub async fn serve(
     addr: String,
     router: Shared,
     streams: SharedStreams,
     keys: SharedKeys,
+    node_key: Option<String>,
 ) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("control api listening on {addr}");
@@ -38,8 +50,9 @@ pub async fn serve(
         let router = router.clone();
         let streams = streams.clone();
         let keys = keys.clone();
+        let node_key = node_key.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(socket, router, streams, keys).await {
+            if let Err(e) = handle(socket, router, streams, keys, node_key).await {
                 eprintln!("control: {e}");
             }
         });
@@ -51,6 +64,7 @@ async fn handle(
     router: Shared,
     streams: SharedStreams,
     keys: SharedKeys,
+    node_key: Option<String>,
 ) -> Result<()> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
@@ -137,6 +151,30 @@ async fn handle(
         })
         .unwrap_or_default();
 
+    // The CONSOLE plane, authenticated with the node key rather than a server
+    // key. A dispatch console is not a player on any world, so it cannot
+    // present a server key - and it must never hold one, because a server key
+    // is authority over that world's routing.
+    //
+    // The browser never sees this key either: the platform holds it and
+    // proxies, handing the console back only a stream token.
+    let presented_node = headers.get("x-node-key").cloned().unwrap_or_default();
+    if !presented_node.is_empty() {
+        let ok = node_key.as_deref().is_some_and(|k| {
+            crate::servers::constant_time_eq(k.as_bytes(), presented_node.as_bytes())
+        });
+        if !ok {
+            return respond(
+                &mut socket,
+                401,
+                &json!({ "ok": false, "error": "bad node key" }),
+            )
+            .await;
+        }
+        let (code, reply) = dispatch_console(&path, &payload, &router, &streams);
+        return respond(&mut socket, code, &reply).await;
+    }
+
     let server = keys.lock().ok().and_then(|k| k.resolve(&presented));
 
     let Some(server) = server else {
@@ -150,6 +188,88 @@ async fn handle(
 
     let (code, reply) = dispatch(&path, &payload, server, &router, &streams);
     respond(&mut socket, code, &reply).await
+}
+
+/// Attach, re-subscribe, detach. Everything a position needs and nothing else.
+fn dispatch_console(
+    path: &str,
+    body: &Value,
+    router: &Shared,
+    streams: &SharedStreams,
+) -> (u16, Value) {
+    let tgs: Vec<u32> = body
+        .get("talkgroups")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64())
+                .map(|x| x as u32)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut r = match router.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let mut s = match streams.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+
+    match path {
+        "console.attach" => {
+            let id = NEXT_CONSOLE.fetch_add(1, Ordering::Relaxed);
+            let client = ClientId::new(CONSOLE_SERVER, id);
+
+            let token = match crate::servers::mint_key() {
+                Ok(t) => t,
+                Err(_) => return (500, json!({ "ok": false, "error": "no randomness" })),
+            };
+
+            // Quality 100: a console is wired into the network, not listening
+            // over the air. Degrading it would simulate a radio path that does
+            // not exist.
+            for tg in &tgs {
+                r.set_member(*tg, client, true, 100);
+            }
+            s.authorize(token.clone(), client);
+
+            println!("console {id} attached to {} talkgroup(s)", tgs.len());
+            (200, json!({ "ok": true, "client": id, "token": token }))
+        }
+
+        "console.update" => match u32_of(body, "client") {
+            Some(id) => {
+                let client = ClientId::new(CONSOLE_SERVER, id);
+                // Forget then re-add rather than diffing. The set is small, and
+                // a diff that drifts leaves a position hearing a talkgroup it
+                // took off its board.
+                r.forget_client(client);
+                for tg in &tgs {
+                    r.set_member(*tg, client, true, 100);
+                }
+                (200, json!({ "ok": true, "talkgroups": tgs.len() }))
+            }
+            None => (400, json!({ "ok": false, "error": "client required" })),
+        },
+
+        "console.detach" => match u32_of(body, "client") {
+            Some(id) => {
+                let client = ClientId::new(CONSOLE_SERVER, id);
+                r.forget_client(client);
+                s.revoke_player(client);
+                println!("console {id} detached");
+                (200, json!({ "ok": true }))
+            }
+            None => (400, json!({ "ok": false, "error": "client required" })),
+        },
+
+        other => (
+            404,
+            json!({ "ok": false, "error": format!("unknown message {other}") }),
+        ),
+    }
 }
 
 fn u32_of(v: &Value, key: &str) -> Option<u32> {

@@ -176,6 +176,13 @@ async fn main() -> Result<()> {
 
     let keys: control::SharedKeys = Arc::new(Mutex::new(servers::KeyIndex::build(enrolled.iter())));
 
+    // The console plane authenticates with this rather than a server key. It is
+    // the same secret the node presents to the platform, deliberately: the
+    // platform should be the only thing that can attach a console.
+    let node_key = std::env::var("VOICED_PLATFORM_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
+
     let control_addr = env_or("VOICED_CONTROL", "127.0.0.1:8787");
     // Players' game clients connect here, so unlike the control port this one
     // has to be reachable from outside the host.
@@ -189,7 +196,7 @@ async fn main() -> Result<()> {
         let streams = streams.clone();
         let keys = keys.clone();
         tokio::spawn(async move {
-            if let Err(e) = control::serve(control_addr, shared, streams, keys).await {
+            if let Err(e) = control::serve(control_addr, shared, streams, keys, node_key).await {
                 eprintln!("control api stopped: {e}");
             }
         });

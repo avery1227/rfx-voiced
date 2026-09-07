@@ -167,6 +167,21 @@ impl Router {
         }
     }
 
+    /// Removes a client from every talkgroup, and releases anything it was
+    /// keying.
+    ///
+    /// A radio leaves by way of its server going away, which `drop_server`
+    /// handles. A console leaves on its own, one at a time, and forgetting to
+    /// release its key would hold a talkgroup open against everybody.
+    pub fn forget_client(&mut self, client: ClientId) {
+        for route in self.routes.values_mut() {
+            route.members.remove(&client);
+            if route.keyed == Some(client) {
+                route.keyed = None;
+            }
+        }
+    }
+
     pub fn unkey(&mut self, tg: u32) {
         if let Some(route) = self.routes.get_mut(&tg) {
             route.keyed = None;

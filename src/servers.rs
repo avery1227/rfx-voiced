@@ -147,7 +147,7 @@ impl KeyIndex {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -166,7 +166,7 @@ fn sha256_hex(input: &str) -> String {
 
 /// 256 bits of system randomness, hex encoded. `ring` is already in the tree
 /// via rustls, so this costs no new dependency.
-fn mint_key() -> Result<String> {
+pub(crate) fn mint_key() -> Result<String> {
     use ring::rand::SecureRandom;
     let rng = ring::rand::SystemRandom::new();
     let mut bytes = [0u8; 32];
