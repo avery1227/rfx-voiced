@@ -100,6 +100,9 @@ pub struct Router {
     /// is attached to.
     session_to_client: HashMap<SessionId, ClientId>,
     client_to_session: HashMap<ClientId, SessionId>,
+    /// Talkgroups cross-connected into one. Audio on any member goes out on
+    /// all of them, and keying any of them takes all of them.
+    patches: Vec<Vec<u32>>,
 }
 
 /// `[12] Arthur Mitchell` -> 12
@@ -190,6 +193,25 @@ impl Router {
     /// 1001 - and exactly one of them is right. Whichever arrives second is
     /// refused here, and its server turns that into a bonk.
     pub fn key(&mut self, tg: u32, client: ClientId) -> Result<Keyed, &'static str> {
+        // A patch makes several talkgroups into one channel, so keying any of
+        // them keys all of them. Without this two people could transmit at
+        // once on what everybody involved is hearing as a single channel.
+        let group = self.joined(tg);
+        if group.len() > 1 {
+            let outcome = self.key_one(tg, client)?;
+            for &other in group.iter().filter(|&&t| t != tg) {
+                // Best effort on the rest: a sibling that refuses is one
+                // somebody else is holding, and the caller already knows the
+                // outcome that matters.
+                let _ = self.key_one(other, client);
+            }
+            return Ok(outcome);
+        }
+
+        self.key_one(tg, client)
+    }
+
+    fn key_one(&mut self, tg: u32, client: ClientId) -> Result<Keyed, &'static str> {
         let route = self.routes.get_mut(&tg).ok_or("no such route")?;
 
         match route.keyed {
@@ -260,16 +282,36 @@ impl Router {
     pub fn destination_of(&self, speaker: ClientId) -> Option<(u32, Vec<(ClientId, u8)>)> {
         for (&tg, route) in &self.routes {
             if route.keyed == Some(speaker) {
-                let listeners = route
-                    .members
-                    .iter()
-                    .filter(|(&c, m)| m.listen && c != speaker)
-                    .map(|(&c, m)| (c, m.quality))
-                    .collect();
-                return Some((tg, listeners));
+                return Some((tg, self.listeners_across(tg, Some(speaker))));
             }
         }
         None
+    }
+
+    /// Listeners on a talkgroup and everything patched to it.
+    ///
+    /// Deduplicated: somebody affiliated to two patched talkgroups is one
+    /// person and must not be sent the same audio twice.
+    fn listeners_across(&self, tg: u32, except: Option<ClientId>) -> Vec<(ClientId, u8)> {
+        let mut out: Vec<(ClientId, u8)> = Vec::new();
+
+        for member in self.joined(tg) {
+            let Some(route) = self.routes.get(&member) else {
+                continue;
+            };
+            for (&c, m) in &route.members {
+                if !m.listen || Some(c) == except {
+                    continue;
+                }
+                match out.iter_mut().find(|(x, _)| *x == c) {
+                    // The better link wins: hearing it once, as well as they
+                    // can, is the right answer.
+                    Some((_, q)) => *q = (*q).max(m.quality),
+                    None => out.push((c, m.quality)),
+                }
+            }
+        }
+        out
     }
 
     /// Who is listening to a talkgroup. Used to tell consoles a call has
@@ -294,13 +336,16 @@ impl Router {
     /// button, and that would end the dispatcher's transmission a second after
     /// it started.
     pub fn unkey_as(&mut self, tg: u32, client: ClientId) -> bool {
-        match self.routes.get_mut(&tg) {
-            Some(route) if route.keyed == Some(client) => {
-                route.keyed = None;
-                true
+        let mut released = false;
+        for other in self.joined(tg) {
+            if let Some(route) = self.routes.get_mut(&other) {
+                if route.keyed == Some(client) {
+                    route.keyed = None;
+                    released = true;
+                }
             }
-            _ => false,
         }
+        released
     }
 
     /// Unconditional release, for teardown paths that own the route outright.
@@ -308,6 +353,43 @@ impl Router {
         if let Some(route) = self.routes.get_mut(&tg) {
             route.keyed = None;
         }
+    }
+
+    // -- Patches ------------------------------------------------------------
+
+    /// Replaces the patch table wholesale.
+    ///
+    /// Whole rather than incremental for the same reason tower overrides are
+    /// stored whole: a patch that half-applied because one message went
+    /// missing is a channel that is joined in one direction only, which is
+    /// worse than not being joined at all and far harder to notice.
+    pub fn set_patches(&mut self, groups: Vec<Vec<u32>>) {
+        self.patches = groups;
+    }
+
+    /// Every talkgroup joined to this one, including itself.
+    ///
+    /// A talkgroup in two patches joins both, transitively - which is what
+    /// somebody who patched A to B and then B to C meant, even if they did not
+    /// think about it.
+    fn joined(&self, tg: u32) -> Vec<u32> {
+        let mut out = vec![tg];
+        let mut grew = true;
+
+        while grew {
+            grew = false;
+            for group in &self.patches {
+                if group.iter().any(|t| out.contains(t)) {
+                    for &t in group {
+                        if !out.contains(&t) {
+                            out.push(t);
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     // -- the hot path -------------------------------------------------------
@@ -320,19 +402,7 @@ impl Router {
     /// common case, because most speech is proximity chat, not radio.
     pub fn destination(&self, session: SessionId) -> Option<(u32, Vec<(ClientId, u8)>)> {
         let speaker = self.client_of(session)?;
-
-        for (&tg, route) in &self.routes {
-            if route.keyed == Some(speaker) {
-                let listeners = route
-                    .members
-                    .iter()
-                    .filter(|(&c, m)| m.listen && c != speaker)
-                    .map(|(&c, m)| (c, m.quality))
-                    .collect();
-                return Some((tg, listeners));
-            }
-        }
-        None
+        self.destination_of(speaker)
     }
 
     /// Per-server counts for the platform heartbeat: bound identities, distinct
@@ -582,5 +652,95 @@ mod tests {
         let unit = ClientId::new(1, 7);
         assert_eq!(r.key(1001, unit), Ok(Keyed::Granted));
         assert_eq!(r.key(1001, unit), Ok(Keyed::Granted));
+    }
+
+    // -- Patches ------------------------------------------------------------
+
+    fn patched_pair() -> (Router, ClientId, ClientId) {
+        let mut r = Router::default();
+        r.open(1001, false);
+        r.open(4001, false);
+        r.set_patches(vec![vec![1001, 4001]]);
+
+        let a = ClientId::new(1, 1);
+        let b = ClientId::new(1, 2);
+        r.set_member(1001, a, true, 100);
+        r.set_member(4001, b, true, 100);
+        (r, a, b)
+    }
+
+    #[test]
+    fn a_patch_delivers_across_talkgroups() {
+        let (mut r, a, b) = patched_pair();
+        r.key(1001, a).unwrap();
+
+        let (tg, listeners) = r.destination_of(a).expect("keyed");
+        assert_eq!(tg, 1001);
+        assert!(
+            listeners.iter().any(|(c, _)| *c == b),
+            "somebody on the patched talkgroup hears it"
+        );
+    }
+
+    #[test]
+    fn keying_one_side_of_a_patch_takes_the_other() {
+        let (mut r, a, b) = patched_pair();
+        r.key(1001, a).unwrap();
+        assert_eq!(
+            r.key(4001, b),
+            Err("route already keyed"),
+            "it is one channel now, so two people cannot both talk on it"
+        );
+    }
+
+    #[test]
+    fn releasing_a_patch_releases_every_member() {
+        let (mut r, a, _) = patched_pair();
+        r.key(1001, a).unwrap();
+        assert!(r.unkey_as(1001, a));
+        assert_eq!(r.destination_of(a), None);
+    }
+
+    #[test]
+    fn a_patch_is_transitive() {
+        let mut r = Router::default();
+        for tg in [1, 2, 3] {
+            r.open(tg, false);
+        }
+        // Somebody patched 1 to 2, then 2 to 3. They meant all three.
+        r.set_patches(vec![vec![1, 2], vec![2, 3]]);
+
+        let speaker = ClientId::new(1, 1);
+        let far = ClientId::new(1, 9);
+        r.set_member(1, speaker, true, 100);
+        r.set_member(3, far, true, 100);
+
+        r.key(1, speaker).unwrap();
+        let (_, listeners) = r.destination_of(speaker).expect("keyed");
+        assert!(listeners.iter().any(|(c, _)| *c == far));
+    }
+
+    #[test]
+    fn somebody_on_two_patched_talkgroups_hears_it_once() {
+        let mut r = Router::default();
+        r.open(1001, false);
+        r.open(4001, false);
+        r.set_patches(vec![vec![1001, 4001]]);
+
+        let speaker = ClientId::new(1, 1);
+        let both = ClientId::new(1, 2);
+        r.set_member(1001, speaker, true, 100);
+        r.set_member(1001, both, true, 60);
+        r.set_member(4001, both, true, 90);
+
+        r.key(1001, speaker).unwrap();
+        let (_, listeners) = r.destination_of(speaker).expect("keyed");
+
+        assert_eq!(listeners.iter().filter(|(c, _)| *c == both).count(), 1);
+        assert_eq!(
+            listeners.iter().find(|(c, _)| *c == both).map(|(_, q)| *q),
+            Some(90),
+            "the better link wins - they hear it once, as well as they can"
+        );
     }
 }

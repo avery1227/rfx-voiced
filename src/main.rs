@@ -166,9 +166,9 @@ async fn main() -> Result<()> {
     // connection pool to the same host.
     let plat = platform::Platform::from_env().map(Arc::new);
 
-    let (enrolled, source) = match &plat {
+    let (enrolled, patches, source) = match &plat {
         Some(p) => p.resolve().await,
-        None => (platform::local_servers()?, "servers.json"),
+        None => (platform::local_servers()?, Vec::new(), "servers.json"),
     };
 
     // An empty list is NOT fatal. A node deployed with a valid key before any
@@ -200,6 +200,9 @@ async fn main() -> Result<()> {
     let stream_addr = env_or("VOICED_STREAM", "0.0.0.0:8788");
 
     let shared: control::Shared = Arc::new(Mutex::new(router::Router::default()));
+    if let Ok(mut r) = shared.lock() {
+        r.set_patches(patches);
+    }
     let streams: stream::SharedStreams = Arc::new(Mutex::new(stream::Streams::default()));
 
     {
@@ -401,10 +404,21 @@ async fn main() -> Result<()> {
                 // Re-read for the next pass. A failed pull returns the cached
                 // list rather than an empty one, so an unreachable dashboard
                 // does not detach every server on the network.
-                list = match &plat {
-                    Some(p) => p.resolve().await.0,
-                    None => platform::local_servers().unwrap_or_default(),
+                let (next, groups) = match &plat {
+                    Some(p) => {
+                        let (s, g, _) = p.resolve().await;
+                        (s, g)
+                    }
+                    None => (platform::local_servers().unwrap_or_default(), Vec::new()),
                 };
+                list = next;
+
+                // Patches are network-wide state, so they are replaced whole
+                // on every poll rather than diffed - a patch that half-applied
+                // is a channel joined in one direction only.
+                if let Ok(mut r) = shared.lock() {
+                    r.set_patches(groups);
+                }
             }
         });
     }

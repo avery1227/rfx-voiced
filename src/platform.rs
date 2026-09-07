@@ -37,6 +37,14 @@ pub struct PlatformServer {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerList {
     pub servers: Vec<PlatformServer>,
+    /// Active patch groups, as talkgroup numbers.
+    ///
+    /// They ride with the server list rather than having an endpoint of their
+    /// own: both are "what the platform says the network looks like", they
+    /// change on the same timescale, and two polls would be two things to keep
+    /// in step for no benefit.
+    #[serde(default)]
+    pub patches: Vec<Vec<u32>>,
 }
 
 pub struct Platform {
@@ -100,17 +108,21 @@ impl Platform {
     }
 
     /// The server list to run with, whichever layer it comes from.
-    pub async fn resolve(&self) -> (Vec<Server>, &'static str) {
+    pub async fn resolve(&self) -> (Vec<Server>, Vec<Vec<u32>>, &'static str) {
         match self.fetch().await {
             Ok(list) => {
                 self.write_cache(&list);
-                (convert(list), "platform")
+                let patches = list.patches.clone();
+                (convert(list), patches, "platform")
             }
             Err(e) => {
                 eprintln!("platform: {e:#}");
                 match self.read_cache() {
-                    Some(list) => (convert(list), "cache"),
-                    None => (Vec::new(), "none"),
+                    Some(list) => {
+                        let patches = list.patches.clone();
+                        (convert(list), patches, "cache")
+                    }
+                    None => (Vec::new(), Vec::new(), "none"),
                 }
             }
         }
