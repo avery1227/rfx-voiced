@@ -61,6 +61,19 @@ const TX_AUDIO: u8 = 18;
 /// Where the PCM starts in an audio frame. Even, so the PCM stays alignable.
 pub const AUDIO_HEADER: usize = 6;
 
+/// The consoles monitoring a talkgroup.
+///
+/// Takes an already-locked router deliberately. Locking it here would mean
+/// callers holding the streams lock could acquire the two in the opposite
+/// order from every other path in this crate, which is a deadlock waiting for
+/// a busy night.
+fn consoles_on(r: &crate::router::Router, tg: u32) -> Vec<crate::router::ClientId> {
+    r.listeners_of(tg)
+        .into_iter()
+        .filter(|c| c.server == crate::control::CONSOLE_SERVER)
+        .collect()
+}
+
 #[derive(Default)]
 pub struct Streams {
     /// token -> client, minted by FXServer.
@@ -267,12 +280,17 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                         // This is the platform's global no-double rule, and a
                         // console gets no exemption from it: if a field unit
                         // holds the talkgroup, dispatch is refused and told so.
-                        let outcome = {
+                        // Both under ONE router lock, and released before the
+                        // streams lock is taken. Every other path here locks
+                        // router-then-streams, and taking them the other way
+                        // round in one place is how a deadlock gets built.
+                        let (outcome, watching) = {
                             let mut r = match router.lock() {
                                 Ok(g) => g,
                                 Err(p) => p.into_inner(),
                             };
-                            r.key(tg, client)
+                            let outcome = r.key(tg, client);
+                            (outcome, consoles_on(&r, tg))
                         };
 
                         let mut s = match streams.lock() {
@@ -293,6 +311,17 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                                 } else {
                                     println!("console {client} keyed tg {tg}");
                                 }
+                                // EVERY console on the talkgroup, not just
+                                // the one that keyed. A game unit's key fans
+                                // out through announce_call; a console's went
+                                // only back to itself, so a position could
+                                // watch a channel it was monitoring stay dark
+                                // while another position transmitted on it -
+                                // and two dispatchers would double because
+                                // neither could see the other.
+                                for c in &watching {
+                                    s.send_call(*c, tg, true, "DISPATCH");
+                                }
                                 s.send_call(client, tg, true, "DISPATCH");
                             }
                             Err(e) => {
@@ -303,7 +332,7 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                     }
 
                     TX_UNKEY => {
-                        {
+                        let watching = {
                             let mut r = match router.lock() {
                                 Ok(g) => g,
                                 Err(p) => p.into_inner(),
@@ -312,11 +341,15 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             // somebody else's call would be a console able to
                             // cut off a field unit by asking nicely.
                             r.unkey_as(tg, client);
-                        }
+                            consoles_on(&r, tg)
+                        };
                         let mut s = match streams.lock() {
                             Ok(g) => g,
                             Err(p) => p.into_inner(),
                         };
+                        for c in &watching {
+                            s.send_call(*c, tg, false, "");
+                        }
                         s.send_call(client, tg, false, "");
                     }
 
