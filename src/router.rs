@@ -342,6 +342,25 @@ impl Router {
     /// A radio leaves by way of its server going away, which `drop_server`
     /// handles. A console leaves on its own, one at a time, and forgetting to
     /// release its key would hold a talkgroup open against everybody.
+    /// Drop a client's MEMBERSHIP without touching what it is transmitting.
+    ///
+    /// A console re-subscribes whenever its board changes, and that used to go
+    /// through `forget_client` - which releases the key as well. So a position
+    /// that changed anything while transmitting had its grant silently
+    /// revoked, and every frame after that was discarded as "not keyed on any
+    /// route". Changing the board is not letting go of the PTT, and the two
+    /// must not be the same operation.
+    ///
+    /// Deliberately keeps `keyed`, `also` and `keyed_by` intact. If the new
+    /// board no longer carries the talkgroup being held, the transmission
+    /// still finishes on it: a dispatcher who is mid-sentence gets to end the
+    /// sentence, and the unkey that follows cleans up normally.
+    pub fn forget_membership(&mut self, client: ClientId) {
+        for route in self.routes.values_mut() {
+            route.members.remove(&client);
+        }
+    }
+
     pub fn forget_client(&mut self, client: ClientId) {
         for route in self.routes.values_mut() {
             route.members.remove(&client);
@@ -643,6 +662,45 @@ mod tests {
     }
     fn cli(server: u32, p: u32) -> ClientId {
         ClientId::new(server, p)
+    }
+
+    /// A console re-subscribing must not release what it is transmitting.
+    ///
+    /// This is the bug where a dispatcher keyed a talkgroup, the board changed
+    /// four hundred milliseconds later because cross-mute bumped a counter,
+    /// and every frame after that was discarded as "not keyed on any route".
+    #[test]
+    fn resubscribing_keeps_the_key() {
+        let mut r = Router::default();
+        let console = cli(0, 1);
+        let other = cli(0, 2);
+
+        r.set_member(1001, console, true, 100);
+        r.set_member(1001, other, true, 100);
+        assert!(r.key(1001, console).is_ok());
+
+        // The board changes mid-transmission: same talkgroups, re-sent.
+        r.forget_membership(console);
+        r.set_member(1001, console, true, 100);
+
+        let dest = r.destination_of(console);
+        assert!(
+            dest.is_some(),
+            "the console lost its own grant on a re-subscribe"
+        );
+        assert_eq!(dest.unwrap().0, 1001);
+    }
+
+    /// Detaching, by contrast, really does have to let go.
+    #[test]
+    fn detaching_releases_the_key() {
+        let mut r = Router::default();
+        let console = cli(0, 1);
+        r.set_member(1001, console, true, 100);
+        assert!(r.key(1001, console).is_ok());
+
+        r.forget_client(console);
+        assert!(r.destination_of(console).is_none());
     }
 
     #[test]

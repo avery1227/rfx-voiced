@@ -289,7 +289,12 @@ fn dispatch_console(
                 // Forget then re-add rather than diffing. The set is small, and
                 // a diff that drifts leaves a position hearing a talkgroup it
                 // took off its board.
-                r.forget_client(client);
+                //
+                // MEMBERSHIP only. This was forget_client, which also releases
+                // the key - so a console that re-subscribed while transmitting
+                // revoked its own grant and everything it said afterwards was
+                // dropped. Re-subscribing is a board change, not an unkey.
+                r.forget_membership(client);
                 for tg in &tgs {
                     r.set_member(*tg, client, true, 100);
                 }
