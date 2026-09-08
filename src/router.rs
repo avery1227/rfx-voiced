@@ -203,6 +203,16 @@ pub struct Router {
     /// press that never got a second, and it costs a few bytes until the same
     /// console is refused there again.
     pending: HashMap<(u32, ClientId), std::time::Instant>,
+    /// What a key ACTUALLY took, per client and the route they pressed.
+    ///
+    /// Keying a patched talkgroup keys its whole group, and the release has to
+    /// give back exactly what was taken - not whatever is joined at the moment
+    /// of release. A dispatcher tears a patch down when the incident ends, and
+    /// that is frequently while somebody still has the button down: the group
+    /// then no longer contains the other members, releasing the pressed route
+    /// never released them, and they stayed keyed FOREVER. Nobody could use
+    /// them again short of restarting the node, and nothing logged it.
+    took: HashMap<(ClientId, u32), Vec<u32>>,
 }
 
 /// How long a dispatcher has to insist after being refused a busy channel.
@@ -336,11 +346,15 @@ impl Router {
                 // outcome that matters.
                 let _ = self.key_one(other, client, now);
             }
+            // Recorded before anything can change it. What is joined now is
+            // not necessarily what will be joined at release.
+            self.took.insert((client, tg), group.clone());
             self.keyed_by.insert(client, tg);
             return Ok(outcome);
         }
 
         let outcome = self.key_one(tg, client, now)?;
+        self.took.insert((client, tg), vec![tg]);
         self.keyed_by.insert(client, tg);
         Ok(outcome)
     }
@@ -642,7 +656,18 @@ impl Router {
     /// it started.
     pub fn unkey_as(&mut self, tg: u32, client: ClientId) -> bool {
         let mut released = false;
-        for other in self.joined(tg) {
+
+        // What the key took, not what is joined now. A patch torn down between
+        // the key and the release used to strand every member except the one
+        // pressed, permanently. Falls back to the current group for a release
+        // with no record - a node restart mid-transmission, or an unkey for a
+        // key that was never granted.
+        let mine = self
+            .took
+            .remove(&(client, tg))
+            .unwrap_or_else(|| self.joined(tg));
+
+        for other in mine {
             if let Some(route) = self.routes.get_mut(&other) {
                 if route.also.contains(&client) {
                     route.also.retain(|&c| c != client);
@@ -757,6 +782,75 @@ mod tests {
     }
     fn cli(server: u32, p: u32) -> ClientId {
         ClientId::new(server, p)
+    }
+    /// A patch is ONE channel. If somebody is talking on any member, nobody
+    /// else may key any other member - that is the entire point of joining
+    /// them, and it is what a dispatcher is relying on when they patch two
+    /// agencies together mid-incident.
+    #[test]
+    fn a_patch_is_busy_on_every_member() {
+        let mut r = Router::default();
+        let a = cli(1, 11);
+        let b = cli(1, 22);
+
+        for tg in [1001, 1002, 1003] {
+            r.set_member(tg, a, true, 100);
+            r.set_member(tg, b, true, 100);
+        }
+        r.set_patches(vec![vec![1001, 1002, 1003]]);
+
+        assert!(matches!(r.key(1001, a), Ok(Keyed::Granted)));
+
+        // Every member, including the one A actually pressed.
+        for tg in [1001, 1002, 1003] {
+            assert!(
+                r.key(tg, b).is_err(),
+                "tg {tg} was keyable while a patch mate was in use",
+            );
+        }
+
+        // And it frees on release, or a patch would jam permanently.
+        assert!(r.unkey_as(1001, a));
+        assert!(
+            r.key(1002, b).is_ok(),
+            "the patch stayed busy after the holder released"
+        );
+    }
+
+    /// The reverse of the same rule: tearing the patch down makes them
+    /// independent channels again.
+    #[test]
+    fn an_unpatched_channel_is_independent_again() {
+        let mut r = Router::default();
+        let a = cli(1, 11);
+        let b = cli(1, 22);
+
+        for tg in [1001, 1002] {
+            r.set_member(tg, a, true, 100);
+            r.set_member(tg, b, true, 100);
+        }
+        r.set_patches(vec![vec![1001, 1002]]);
+        assert!(r.key(1001, a).is_ok());
+        assert!(r.key(1002, b).is_err());
+
+        // The patch goes away WHILE A still has the button down - which is
+        // exactly when a dispatcher tears one down, as the incident ends. A
+        // still holds both; the tear-down does not retroactively unkey anybody.
+        r.set_patches(vec![]);
+        assert!(
+            r.key(1002, b).is_err(),
+            "A still holds it, patch or no patch"
+        );
+
+        // A releases the route A actually pressed. THIS is where it used to go
+        // wrong: unkey walked the CURRENT group, which no longer contained
+        // 1002, so 1002 stayed keyed by a client who had let go - forever, with
+        // nothing logging it and no way back short of restarting the node.
+        assert!(r.unkey_as(1001, a));
+        assert!(
+            r.key(1002, b).is_ok(),
+            "1002 was stranded keyed after the patch was torn down and A released"
+        );
     }
 
     /// A dispatcher's FIRST press on a busy channel is refused like anybody

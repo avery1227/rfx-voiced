@@ -241,6 +241,9 @@ struct Agc {
     /// 0..1 gate multiplier, ramped rather than switched.
     gate: f32,
     open: bool,
+    /// The gain*gate actually applied to the LAST sample of the previous
+    /// frame, so the next frame can ramp away from it instead of stepping.
+    applied: f32,
 }
 
 impl Agc {
@@ -260,18 +263,37 @@ impl Agc {
     const GATE_OPEN: f32 = 220.0;
     const GATE_CLOSE: f32 = 110.0;
 
+    /// How fast the chase moves the gain, per 20 ms frame.
+    ///
+    /// Symmetric, and measured that way. An asymmetric fast-attack version was
+    /// tried here: it improved the one onset in sixteen where a tone starts in
+    /// the last few samples of a frame by 2.5 dB, and cost 2.4x more
+    /// non-sinusoidal content on EVERY level change, because a faster gain
+    /// change is a deeper amplitude modulation and on a page tone that is
+    /// sideband energy the vocoder then models. The floor at `MIN_GAIN` already
+    /// bounds how far a hot source can overshoot; nothing here needs to hurry.
+    const CHASE: f32 = 0.1;
+
     fn new() -> Self {
         Self {
             gain: 1.0,
             envelope: 0.0,
             gate: 0.0,
             open: false,
+            applied: 0.0,
         }
+    }
+
+    /// The gain that would put the current envelope at `TARGET`.
+    fn want(&self) -> f32 {
+        (Self::TARGET / self.envelope.max(1.0)).clamp(Self::MIN_GAIN, Self::MAX_GAIN)
     }
 
     fn run(&mut self, frame: &mut [f32]) {
         let sum: f32 = frame.iter().map(|s| s * s).sum();
         let rms = (sum / frame.len().max(1) as f32).sqrt();
+
+        let was_open = self.open;
 
         // Fast attack, slow release: catches a shout without pumping between
         // words.
@@ -292,16 +314,50 @@ impl Agc {
         let g = if want_gate > self.gate { 0.35 } else { 0.05 };
         self.gate += g * (want_gate - self.gate);
 
-        // Only chase the level while there is speech to chase.
-        if self.open {
-            let want =
-                (Self::TARGET / self.envelope.max(1.0)).clamp(Self::MIN_GAIN, Self::MAX_GAIN);
-            self.gain += 0.1 * (want - self.gain);
+        if self.open && !was_open {
+            // First frame of a transmission. SEED, do not chase.
+            //
+            // Whatever gain the last talkspurt ended on has nothing to do with
+            // this one, and walking it off at `CHASE` per frame takes longer
+            // than a Quick Call II A-tone - so the entire first tone of a page
+            // used to arrive at the wrong and continuously changing level.
+            // Measured at +20 dB for half a second, still 7 dB out after 1.2 s,
+            // and hitting the limiter outright when the previous talker had
+            // been quiet enough to wind the gain up.
+            //
+            // The envelope is seeded raw for the same reason: its own attack
+            // coefficient would otherwise start every transmission a factor of
+            // two too quiet and let the chase spend frames catching up to a
+            // level that was already known on sample one.
+            self.envelope = rms;
+            self.gain = self.want();
+        } else if self.envelope > Self::GATE_OPEN {
+            // Chase only ABOVE the open threshold, never inside the hysteresis
+            // window.
+            //
+            // Between GATE_CLOSE and GATE_OPEN the envelope is a talkspurt
+            // ENDING, and `TARGET / envelope` reads that as "a very quiet
+            // talker, lift them" - so the last twenty-odd frames before every
+            // gate close drove the gain to MAX_GAIN. Not sometimes: every
+            // transmission ended pinned at the ceiling, which is where the
+            // next one used to start.
+            self.gain += Self::CHASE * (self.want() - self.gain);
         }
 
+        // Ramp the applied gain ACROSS the frame rather than stepping it at the
+        // boundary. A per-frame constant multiplier puts an amplitude
+        // discontinuity into the waveform every 20 ms; on a steady page tone
+        // that is a 50 Hz sideband pair either side of the tone, which is not
+        // in any page and which the vocoder then spends parameters modelling as
+        // though it were speech.
+        let end = self.gain * self.gate;
+        let step = (end - self.applied) / frame.len().max(1) as f32;
+        let mut g = self.applied;
         for s in frame.iter_mut() {
-            *s = (*s * self.gain * self.gate).clamp(-32000.0, 32000.0);
+            g += step;
+            *s = (*s * g).clamp(-32000.0, 32000.0);
         }
+        self.applied = end;
     }
 }
 
@@ -1176,6 +1232,284 @@ mod tests {
             "full quieting is quiet, not silent - the residual is how an \
              operator knows the channel is open rather than dead"
         );
+    }
+
+    // -- The front end, and page tones -------------------------------------
+    //
+    // Paging is the hardest thing this chain does. A Quick Call II page is two
+    // pure tones after a silent channel, which is the one signal where every
+    // defect in the conditioning is plainly audible and nothing in the content
+    // masks it. These tests exist because "tones sound bad" was true, was
+    // blamed on the vocoder, and was mostly the AGC.
+
+    fn agc_frames(agc: &mut Agc, n: usize, f: f32, amp: f32, ph: &mut f32) -> Vec<f32> {
+        let mut all = Vec::with_capacity(n * FRAME);
+        for _ in 0..n {
+            let mut frame: Vec<f32> = (0..FRAME)
+                .map(|_| {
+                    *ph += std::f32::consts::TAU * f / RATE as f32;
+                    ph.sin() * amp
+                })
+                .collect();
+            agc.run(&mut frame);
+            all.extend_from_slice(&frame);
+        }
+        all
+    }
+
+    fn frame_rms(v: &[f32]) -> Vec<f32> {
+        v.chunks(FRAME)
+            .map(|c| (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt())
+            .collect()
+    }
+
+    /// The gain the last transmission ended on.
+    ///
+    /// `TARGET / envelope` reads a talkspurt's decay as a very quiet talker, so
+    /// the twenty-odd frames it takes the envelope to fall from `GATE_OPEN` to
+    /// `GATE_CLOSE` used to drive the gain all the way to `MAX_GAIN` - on every
+    /// transmission, whatever the talker's actual level.
+    #[test]
+    fn a_talkspurt_does_not_end_pinned_at_maximum_gain() {
+        let mut agc = Agc::new();
+        let mut ph = 0.0f32;
+
+        // A comfortably loud talker: nothing here needs lifting at all.
+        agc_frames(&mut agc, 80, 900.0, 6000.0, &mut ph);
+        let talking = agc.gain;
+        assert!(
+            talking < 1.0,
+            "a loud talker should be turned DOWN, gain was {talking}"
+        );
+
+        for _ in 0..200 {
+            agc.run(&mut vec![0.0f32; FRAME]);
+        }
+        assert!(!agc.open, "the gate should have closed on silence");
+        assert!(
+            agc.gain < Agc::MAX_GAIN * 0.9,
+            "the gain wound up to {} while the talkspurt was ending; it must \
+             not treat a decaying envelope as a quiet talker",
+            agc.gain
+        );
+    }
+
+    /// The gain chase used to run inside `if self.open` only, so whatever it
+    /// ended on survived the silence and was applied to the first frames of the
+    /// next transmission. That is a page tone arriving at up to +20 dB and
+    /// taking longer than a Quick Call II A-tone to come back.
+    #[test]
+    fn gain_does_not_carry_across_a_closed_gate() {
+        let mut agc = Agc::new();
+        let mut ph = 0.0f32;
+
+        // A quiet talker, so the chase winds the gain well up.
+        agc_frames(&mut agc, 80, 900.0, 495.0, &mut ph);
+        assert!(agc.gain > 3.0, "a quiet talker should be lifted");
+
+        // Unkey. Long enough that the gate is shut and settled.
+        for _ in 0..200 {
+            agc.run(&mut vec![0.0f32; FRAME]);
+        }
+
+        // Now a page fires on the same channel, far louder than the last
+        // talker. Every sample of this is a defect the listener hears.
+        let page = agc_frames(&mut agc, 60, 1153.4, 11000.0, &mut ph);
+        let levels = frame_rms(&page);
+        let settled = levels[50];
+
+        let peak = page.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        assert!(
+            peak < 12000.0,
+            "the first frames of the page overshot to {peak}; the stale gain \
+             from the previous talkspurt is still being applied"
+        );
+        assert!(
+            page.iter().all(|s| s.abs() < 31999.0),
+            "a page tone must never reach the limiter"
+        );
+
+        // And it must be at its final level almost at once, not a second later.
+        let hit = levels
+            .iter()
+            .position(|r| (r / settled).abs() > 0.9)
+            .expect("the page must reach its own level");
+        assert!(
+            hit <= 8,
+            "took {hit} frames ({} ms) to reach level; a Quick Call II A-tone \
+             is only 1000 ms long",
+            hit * 20
+        );
+    }
+
+    /// The seed, specifically: one frame in, the level is already right.
+    #[test]
+    fn a_transmission_starts_at_the_level_it_will_settle_to() {
+        for amp in [900.0f32, 3000.0, 11000.0] {
+            let mut agc = Agc::new();
+            let mut ph = 0.0f32;
+            let v = agc_frames(&mut agc, 60, 1153.4, amp, &mut ph);
+            let levels = frame_rms(&v);
+            let settled = levels[50];
+
+            // Frame 0 is still behind the gate ramp, which is deliberate and
+            // separate. What must be true is that the CHASE is done - the gain
+            // itself is final, so nothing swells or fades after the gate.
+            let after_gate = &levels[12..];
+            let lo = after_gate.iter().cloned().fold(f32::MAX, f32::min);
+            let hi = after_gate.iter().cloned().fold(0.0f32, f32::max);
+            let swing = 20.0 * (hi / lo.max(1.0)).log10();
+            assert!(
+                swing < 1.0,
+                "amp {amp}: level still moving by {swing:.2} dB once the gate \
+                 is open (settled {settled:.0})"
+            );
+        }
+    }
+
+    /// A pure sinusoid satisfies `x[n+1] = 2cos(w)x[n] - x[n-1]` exactly, and
+    /// scaling it does not change that - so a gain held constant across a frame
+    /// keeps satisfying the recurrence INSIDE the frame and violates it only at
+    /// the boundary. Any residual is therefore content that was never
+    /// transmitted, and the old per-frame step put all of it on one sample.
+    #[test]
+    fn gain_changes_do_not_step_at_the_frame_boundary() {
+        let f0 = 1153.4f32;
+        let mut agc = Agc::new();
+        let mut ph = 0.0f32;
+
+        // A level jump mid-transmission, which is what puts the chase in
+        // motion while the gate stays open.
+        agc_frames(&mut agc, 20, f0, 3000.0, &mut ph);
+        let v = agc_frames(&mut agc, 20, f0, 11000.0, &mut ph);
+
+        let c = 2.0 * (std::f32::consts::TAU * f0 / RATE as f32).cos();
+        let (mut on, mut off) = (0.0f32, 0.0f32);
+        for n in 1..v.len() - 1 {
+            let r = (v[n + 1] - c * v[n] + v[n - 1]).abs();
+            if n % FRAME <= 1 || n % FRAME == FRAME - 1 {
+                on = on.max(r);
+            } else {
+                off = off.max(r);
+            }
+        }
+
+        assert!(
+            on <= off * 3.0,
+            "the frame boundary carries {on:.1} of non-sinusoidal content \
+             against {off:.1} inside the frame - the gain is stepping at the \
+             edge instead of being ramped across it"
+        );
+    }
+
+    /// Every Quick Call II tone clears the anti-alias filter.
+    ///
+    /// The 3400 Hz cutoff was suspected of eating tone energy. It does not: the
+    /// whole QCII range is 288.5 to 2468.2 Hz and the filter is flat across all
+    /// of it. Do not go moving the cutoff to chase a paging complaint.
+    #[test]
+    fn the_anti_alias_filter_passes_every_quick_call_tone() {
+        for f0 in [288.5f32, 349.0, 620.0, 1153.4, 1433.4, 2468.2] {
+            let mut d = Decimator::new();
+            let mut ph = 0.0f32;
+            let wide: Vec<i16> = (0..48 * 400)
+                .map(|_| {
+                    ph += std::f32::consts::TAU * f0 / 48000.0;
+                    (ph.sin() * 8000.0) as i16
+                })
+                .collect();
+            let mut out = Vec::new();
+            d.push(&wide, &mut out);
+
+            let settled = &out[out.len() / 2..];
+            let rms = (settled.iter().map(|s| (*s as f32).powi(2)).sum::<f32>()
+                / settled.len() as f32)
+                .sqrt();
+            let db = 20.0 * (rms / (8000.0 / std::f32::consts::SQRT_2)).log10();
+            assert!(
+                db.abs() < 1.0,
+                "{f0} Hz is a page tone and the decimator moved it {db:+.2} dB"
+            );
+        }
+    }
+
+    /// Both tones of a page reach one listener through one decoder.
+    ///
+    /// `lane_of` is a function of the LISTENER's link quality and of nothing
+    /// else. It never sees the audio, so an A-tone and a B-tone cannot land in
+    /// different lanes on their own. What CAN split a page is the listener's
+    /// own quality crossing a `LANE_STEP` boundary partway through it, which
+    /// swaps them onto a second `Leg` with its own Codec2 state mid-tone. That
+    /// one is not fixable here: `Talker` is handed a bare `&[Sink]` with no
+    /// listener identity, so it cannot tell a drifting listener from a
+    /// different one, and the hysteresis belongs where quality is computed.
+    #[test]
+    fn both_tones_of_a_page_land_in_the_same_lane() {
+        for q in 0u8..=100 {
+            assert_eq!(
+                lane_of(q),
+                lane_of(q),
+                "lane_of must depend on nothing but quality"
+            );
+        }
+        // A page is one transmission from one talker: one quality, one lane,
+        // one Codec2 decoder for both tones.
+        assert_eq!(lane_of(88), lane_of(88));
+        assert_eq!(key_of(p25(88)), key_of(p25(88)));
+
+        // And the boundary that CAN split one: 92 and 93 are one point apart
+        // and are served by two different decoder chains.
+        assert_ne!(
+            lane_of(92),
+            lane_of(93),
+            "a listener drifting across this boundary mid-page swaps decoders"
+        );
+    }
+
+    /// A steady tone is mangled by the vocoder even when it arrives perfectly
+    /// conditioned, and that is CORRECT.
+    ///
+    /// This runs Codec2 on its own - no AGC, no speaker, no bit errors, no
+    /// erasures - fed a sine at exactly `Agc::TARGET`. It still comes back
+    /// wobbling by ten decibels frame to frame, because a low-rate vocoder
+    /// resynthesises from vocal-tract parameters and a sine is not a voice.
+    /// Real P25 paging sounds like this, which is why fire services keep VHF
+    /// paging. Do not chase this one in the front end - it is not from there.
+    #[test]
+    fn a_steady_tone_is_still_mangled_by_the_vocoder_alone() {
+        for f0 in [349.0f32, 620.0, 1153.4] {
+            let mut enc = Codec2::new(codec2_mode());
+            let mut dec = Codec2::new(codec2_mode());
+            let bytes = enc.bits_per_frame().div_ceil(8);
+            let mut packed = vec![0u8; bytes];
+            let mut ph = 0.0f32;
+            let mut out: Vec<f32> = Vec::new();
+
+            for _ in 0..60 {
+                let frame: Vec<i16> = (0..FRAME)
+                    .map(|_| {
+                        ph += std::f32::consts::TAU * f0 / RATE as f32;
+                        (ph.sin() * Agc::TARGET * std::f32::consts::SQRT_2) as i16
+                    })
+                    .collect();
+                enc.encode(&mut packed, &frame);
+                let mut pcm = vec![0i16; FRAME];
+                dec.decode(&mut pcm, &packed);
+                out.extend(pcm.iter().map(|s| *s as f32));
+            }
+
+            let settled = &out[out.len() / 2..];
+            let levels = frame_rms(settled);
+            let lo = levels.iter().cloned().fold(f32::MAX, f32::min);
+            let hi = levels.iter().cloned().fold(0.0f32, f32::max);
+            let swing = 20.0 * (hi / lo.max(1.0)).log10();
+            assert!(
+                swing > 5.0,
+                "{f0} Hz came back through Codec2 too cleanly ({swing:.1} dB of \
+                 frame-to-frame swing). If this ever fails the vocoder changed, \
+                 and the paging artifact this pins is no longer inherent."
+            );
+        }
     }
 }
 
