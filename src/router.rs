@@ -121,6 +121,32 @@ pub struct Route {
     pub also: Vec<ClientId>,
 }
 
+/// Conventional routes carry the high bit. That is not a convention this file
+/// is choosing to follow - it is the definition, shared with the platform's
+/// src/lib/routes.ts and the resource's Conventional.routeId.
+pub const CONV_BASE: u32 = 0x8000_0000;
+
+/// What a route id says about itself, before anybody tells us anything.
+///
+/// A route is created by whoever touches it first, and that is often a CONSOLE
+/// subscribing - which arrives before any FXServer has opened the channel,
+/// because a dispatcher can put a talkgroup on their board that nobody in the
+/// world is tuned to. Defaulting such a route to trunked rendered every VHF and
+/// UHF channel through the P25 vocoder, so all three bands sounded identical on
+/// a console and the whole point of a mixed-band system was inaudible.
+///
+/// The id is enough to know better. Above the base it is a frequency, and the
+/// frequency itself says whether it is AM: civil airband is 108-137 MHz and is
+/// the one band in common use that still is. An FXServer opening the channel
+/// later may refine this; it will not contradict it.
+fn classify(id: u32) -> (bool, bool) {
+    if id < CONV_BASE {
+        return (false, false);
+    }
+    let mhz = (id & !CONV_BASE) as f32 / 10_000.0;
+    (true, (108.0..137.0).contains(&mhz))
+}
+
 impl Route {
     fn mode(&self) -> crate::dsp::Mode {
         match (self.conventional, self.am) {
@@ -248,7 +274,19 @@ impl Router {
     }
 
     pub fn set_member(&mut self, tg: u32, client: ClientId, listen: bool, quality: u8) {
-        let route = self.routes.entry(tg).or_default();
+        let route = self.routes.entry(tg).or_insert_with(|| {
+            // Classified on creation. A console subscribing is usually the
+            // first thing to touch a route, and a route that defaulted to
+            // trunked stayed trunked until an FXServer happened to open it -
+            // so a VHF channel with nobody in the world on it was rendered
+            // through the P25 vocoder for the dispatcher listening to it.
+            let (conventional, am) = classify(tg);
+            Route {
+                conventional,
+                am,
+                ..Default::default()
+            }
+        });
         route.members.insert(client, Member { listen, quality });
     }
 
@@ -662,6 +700,53 @@ mod tests {
     }
     fn cli(server: u32, p: u32) -> ClientId {
         ClientId::new(server, p)
+    }
+
+    /// A console subscribing to a VHF channel nobody in the world is on must
+    /// still hear it as FM. This was the bug that made all three bands sound
+    /// identical on a console: the route was created by the subscription, and
+    /// a route created without an opinion defaulted to trunked.
+    #[test]
+    fn a_subscription_alone_classifies_the_band() {
+        let mut r = Router::default();
+        let console = cli(0, 1);
+
+        // 154.2650 MHz - VHF fireground, and no FXServer has opened it.
+        let vhf = CONV_BASE | 1_542_650;
+        r.set_member(vhf, console, true, 100);
+        assert_eq!(
+            r.routes.get(&vhf).map(Route::mode),
+            Some(crate::dsp::Mode::Fm)
+        );
+
+        // 123.0250 MHz - civil airband, which is still AM.
+        let air = CONV_BASE | 1_230_250;
+        r.set_member(air, console, true, 100);
+        assert_eq!(
+            r.routes.get(&air).map(Route::mode),
+            Some(crate::dsp::Mode::Am)
+        );
+
+        // A talkgroup is below the base and stays trunked.
+        r.set_member(1001, console, true, 100);
+        assert_eq!(
+            r.routes.get(&1001).map(Route::mode),
+            Some(crate::dsp::Mode::P25)
+        );
+    }
+
+    /// An FXServer opening a channel may refine the classification - it knows
+    /// the codeplug - but must never be contradicted by it.
+    #[test]
+    fn opening_a_channel_still_wins() {
+        let mut r = Router::default();
+        let air = CONV_BASE | 1_230_250;
+        r.set_member(air, cli(0, 1), true, 100);
+        r.open_conventional(air, false); // the codeplug says FM after all
+        assert_eq!(
+            r.routes.get(&air).map(Route::mode),
+            Some(crate::dsp::Mode::Fm)
+        );
     }
 
     /// A console re-subscribing must not release what it is transmitting.
