@@ -629,7 +629,10 @@ impl Router {
     /// A talkgroup in two patches joins both, transitively - which is what
     /// somebody who patched A to B and then B to C meant, even if they did not
     /// think about it.
-    fn joined(&self, tg: u32) -> Vec<u32> {
+    /// Public because a call has to be ANNOUNCED across a patch as well as
+    /// heard across one. Audio crossing without the indication crossing leaves
+    /// a dispatcher hearing traffic on a module that stays dark.
+    pub fn joined(&self, tg: u32) -> Vec<u32> {
         let mut out = vec![tg];
         let mut grew = true;
 

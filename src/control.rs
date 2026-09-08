@@ -359,21 +359,34 @@ fn dispatch_console(
 /// already knows - sending it twice would mean two sources of truth for the
 /// same fact, disagreeing whenever one is late.
 fn announce_call(r: &Router, streams: &SharedStreams, tg: u32, keyed: bool, talker: &str) {
-    let consoles: Vec<_> = r
-        .listeners_of(tg)
-        .into_iter()
-        .filter(|c| c.server == CONSOLE_SERVER)
-        .collect();
-    if consoles.is_empty() {
-        return;
-    }
+    // ACROSS THE PATCH GROUP, and announced on the route each console is
+    // actually watching.
+    //
+    // A patch joins talkgroups, so audio keyed on one is heard on all of them -
+    // that part worked. The INDICATION did not: this announced on one route
+    // only, so a dispatcher monitoring the other side of a patch heard the
+    // traffic while their module stayed dark, and a module that is silent about
+    // a call it is passing is worse than one that shows nothing at all.
+    //
+    // Each console is told the route IT holds, not the route that was keyed.
+    // A console never subscribed to the far side, and a call announced on a
+    // talkgroup that is not on its board matches no module and is dropped.
+    let group = r.joined(tg);
 
     let mut s = match streams.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    for c in consoles {
-        s.send_call(c, tg, keyed, talker);
+
+    let mut told: Vec<ClientId> = Vec::new();
+    for member in group {
+        for c in r.listeners_of(member) {
+            if c.server != CONSOLE_SERVER || told.contains(&c) {
+                continue;
+            }
+            told.push(c);
+            s.send_call(c, member, keyed, talker);
+        }
     }
 }
 
