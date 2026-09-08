@@ -163,7 +163,12 @@ impl Streams {
     }
 }
 
-pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Result<()> {
+pub async fn serve(
+    addr: String,
+    streams: SharedStreams,
+    router: Shared,
+    recorder: crate::recorder::SharedRecorder,
+) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("audio stream listening on {addr}");
 
@@ -171,6 +176,7 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
         let (socket, peer) = listener.accept().await?;
         let streams = streams.clone();
         let router = router.clone();
+        let recorder = recorder.clone();
 
         tokio::spawn(async move {
             // The token arrives in the request URI. Captured during the
@@ -311,6 +317,20 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                                 } else {
                                     println!("console {client} keyed tg {tg}");
                                 }
+
+                                // RECORDED, like anything else on the air. The
+                                // recorder was wired into the Mumble tap only,
+                                // so instant recall held every field unit's
+                                // traffic and none of dispatch's - and the one
+                                // transmission a dispatcher most often needs to
+                                // play back is the one they just made
+                                // themselves, to check what they actually said.
+                                //
+                                // Player id 0: a console is not a player
+                                // anywhere, and its name says so instead.
+                                if let Ok(mut rec) = recorder.lock() {
+                                    rec.begin(tg, client.server, 0, "DISPATCH", crate::dsp::RATE);
+                                }
                                 // EVERY console on the talkgroup, not just
                                 // the one that keyed. A game unit's key fans
                                 // out through announce_call; a console's went
@@ -351,6 +371,11 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             s.send_call(*c, tg, false, "");
                         }
                         s.send_call(client, tg, false, "");
+                        drop(s);
+
+                        if let Ok(mut rec) = recorder.lock() {
+                            rec.end(tg);
+                        }
                     }
 
                     TX_AUDIO => {
@@ -432,6 +457,22 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             Ok(g) => g,
                             Err(p) => p.into_inner(),
                         };
+                        // The cleanest un-bridged lane matching the speaker's
+                        // own mode, exactly as the Mumble path chooses - a
+                        // recording should be what went out, not what the
+                        // worst-placed listener happened to receive.
+                        if let Some((_, pcm)) = lanes
+                            .iter()
+                            .filter(|((m, _, bridged), _)| !bridged && *m == src.mode)
+                            .max_by_key(|((_, lane, _), _)| *lane)
+                        {
+                            if !pcm.is_empty() {
+                                if let Ok(mut rec) = recorder.lock() {
+                                    rec.push(live_tg, pcm);
+                                }
+                            }
+                        }
+
                         let mut sent = 0usize;
                         for (key, pcm8) in &lanes {
                             if pcm8.is_empty() {
@@ -473,6 +514,13 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                 if let Some((tg, _)) = r.destination_of(client) {
                     println!("console {client} dropped while keyed on tg {tg}");
                     r.unkey(tg);
+                    drop(r);
+                    // Otherwise the call stays open forever and never appears
+                    // in recall at all - the recording is only written when it
+                    // ends.
+                    if let Ok(mut rec) = recorder.lock() {
+                        rec.end(tg);
+                    }
                 }
             }
 
