@@ -194,7 +194,23 @@ pub struct Router {
     /// consoles and written into the recording.
     keyed_by: HashMap<ClientId, u32>,
     patches: Vec<Vec<u32>>,
+    /// Consoles that have been refused a busy route and may insist.
+    ///
+    /// A dispatcher's first press on an occupied channel is refused; a second
+    /// inside PREEMPT_WINDOW takes it. This remembers the first, so the second
+    /// can tell a deliberate override from a reflex. Cleared on a successful
+    /// preemption, and it expires on its own - an entry left behind is one
+    /// press that never got a second, and it costs a few bytes until the same
+    /// console is refused there again.
+    pending: HashMap<(u32, ClientId), std::time::Instant>,
 }
+
+/// How long a dispatcher has to insist after being refused a busy channel.
+///
+/// Long enough to press twice deliberately, short enough that a press half a
+/// minute later - a different thought, a different call - does not cut somebody
+/// off because of a refusal the operator has already forgotten about.
+pub const PREEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// `[12] Arthur Mitchell` -> 12
 pub fn player_id_from_username(name: &str) -> Option<u32> {
@@ -297,28 +313,44 @@ impl Router {
     /// 1001 - and exactly one of them is right. Whichever arrives second is
     /// refused here, and its server turns that into a bonk.
     pub fn key(&mut self, tg: u32, client: ClientId) -> Result<Keyed, &'static str> {
+        self.key_at(tg, client, std::time::Instant::now())
+    }
+
+    /// The same, at an explicit moment. Split out so the two-press preemption
+    /// window below can be tested without sleeping.
+    pub fn key_at(
+        &mut self,
+        tg: u32,
+        client: ClientId,
+        now: std::time::Instant,
+    ) -> Result<Keyed, &'static str> {
         // A patch makes several talkgroups into one channel, so keying any of
         // them keys all of them. Without this two people could transmit at
         // once on what everybody involved is hearing as a single channel.
         let group = self.joined(tg);
         if group.len() > 1 {
-            let outcome = self.key_one(tg, client)?;
+            let outcome = self.key_one(tg, client, now)?;
             for &other in group.iter().filter(|&&t| t != tg) {
                 // Best effort on the rest: a sibling that refuses is one
                 // somebody else is holding, and the caller already knows the
                 // outcome that matters.
-                let _ = self.key_one(other, client);
+                let _ = self.key_one(other, client, now);
             }
             self.keyed_by.insert(client, tg);
             return Ok(outcome);
         }
 
-        let outcome = self.key_one(tg, client)?;
+        let outcome = self.key_one(tg, client, now)?;
         self.keyed_by.insert(client, tg);
         Ok(outcome)
     }
 
-    fn key_one(&mut self, tg: u32, client: ClientId) -> Result<Keyed, &'static str> {
+    fn key_one(
+        &mut self,
+        tg: u32,
+        client: ClientId,
+        now: std::time::Instant,
+    ) -> Result<Keyed, &'static str> {
         let route = self.routes.get_mut(&tg).ok_or("no such route")?;
 
         match route.keyed {
@@ -358,8 +390,30 @@ impl Router {
                 // because two dispatchers colliding is a coordination problem
                 // and giving one of them a silent win only hides it.
                 if client.is_console() && !holder.is_console() {
-                    route.keyed = Some(client);
-                    Ok(Keyed::Preempted(holder))
+                    // NOT ON THE FIRST PRESS. Taking the channel the instant a
+                    // dispatcher's thumb lands means every accidental brush of
+                    // PTT cuts somebody off mid-word, and a console that
+                    // silently wins every collision teaches an operator that
+                    // the channel is always theirs - which is exactly the habit
+                    // a busy channel is meant to break.
+                    //
+                    // So the first press is refused like anyone else's, and
+                    // says how to insist. A second press inside the window is a
+                    // deliberate act, and that one takes the channel. This is
+                    // how a priority key works on a real console: it is a
+                    // decision, not a reflex.
+                    let asked = self.pending.get(&(tg, client)).copied();
+                    let insisting = asked.is_some_and(|t| now.duration_since(t) <= PREEMPT_WINDOW);
+
+                    if insisting {
+                        self.pending.remove(&(tg, client));
+                        let route = self.routes.get_mut(&tg).ok_or("no such route")?;
+                        route.keyed = Some(client);
+                        return Ok(Keyed::Preempted(holder));
+                    }
+
+                    self.pending.insert((tg, client), now);
+                    Err("busy - key again to take the channel")
                 } else if !client.is_console() && holder.is_console() {
                     Err("dispatch is transmitting")
                 } else {
@@ -705,6 +759,110 @@ mod tests {
         ClientId::new(server, p)
     }
 
+    /// A dispatcher's FIRST press on a busy channel is refused like anybody
+    /// else's. Taking it on the first press means every accidental brush of
+    /// PTT cuts somebody off mid-word.
+    #[test]
+    fn dispatch_is_refused_before_it_may_insist() {
+        let mut r = Router::default();
+        let unit = cli(1, 11);
+        let desk = cli(0, 1);
+        r.set_member(1001, unit, true, 100);
+        r.set_member(1001, desk, true, 100);
+
+        let t0 = std::time::Instant::now();
+        assert!(matches!(r.key_at(1001, unit, t0), Ok(Keyed::Granted)));
+
+        let refused = r.key_at(1001, desk, t0);
+        assert!(
+            refused.is_err(),
+            "a console took the channel on its first press"
+        );
+
+        // The unit still holds it, which is the point.
+        assert_eq!(r.routes.get(&1001).and_then(|x| x.keyed), Some(unit));
+    }
+
+    /// A SECOND press inside the window is a deliberate act, and takes it.
+    #[test]
+    fn dispatch_takes_the_channel_when_it_insists() {
+        let mut r = Router::default();
+        let unit = cli(1, 11);
+        let desk = cli(0, 1);
+        r.set_member(1001, unit, true, 100);
+        r.set_member(1001, desk, true, 100);
+
+        let t0 = std::time::Instant::now();
+        assert!(r.key_at(1001, unit, t0).is_ok());
+        assert!(r.key_at(1001, desk, t0).is_err());
+
+        let again = r.key_at(1001, desk, t0 + std::time::Duration::from_millis(700));
+        assert!(matches!(again, Ok(Keyed::Preempted(p)) if p == unit));
+        assert_eq!(r.routes.get(&1001).and_then(|x| x.keyed), Some(desk));
+    }
+
+    /// A press long after the refusal is a new thought, not an override. It
+    /// must be refused again rather than cutting somebody off because of a
+    /// refusal the operator has already forgotten.
+    #[test]
+    fn insistence_expires() {
+        let mut r = Router::default();
+        let unit = cli(1, 11);
+        let desk = cli(0, 1);
+        r.set_member(1001, unit, true, 100);
+        r.set_member(1001, desk, true, 100);
+
+        let t0 = std::time::Instant::now();
+        assert!(r.key_at(1001, unit, t0).is_ok());
+        assert!(r.key_at(1001, desk, t0).is_err());
+
+        let late = r.key_at(
+            1001,
+            desk,
+            t0 + PREEMPT_WINDOW + std::time::Duration::from_secs(1),
+        );
+        assert!(late.is_err(), "a stale refusal still preempted");
+        assert_eq!(r.routes.get(&1001).and_then(|x| x.keyed), Some(unit));
+    }
+
+    /// Neither direction of this is negotiable: a subscriber never takes a
+    /// channel from dispatch, however many times it presses.
+    #[test]
+    fn a_unit_never_preempts_dispatch() {
+        let mut r = Router::default();
+        let unit = cli(1, 11);
+        let desk = cli(0, 1);
+        r.set_member(1001, unit, true, 100);
+        r.set_member(1001, desk, true, 100);
+
+        let t0 = std::time::Instant::now();
+        assert!(r.key_at(1001, desk, t0).is_ok());
+        for n in 0..4 {
+            let t = t0 + std::time::Duration::from_millis(200 * n);
+            assert!(r.key_at(1001, unit, t).is_err());
+        }
+        assert_eq!(r.routes.get(&1001).and_then(|x| x.keyed), Some(desk));
+    }
+
+    /// Two dispatchers colliding is a coordination problem, and letting one
+    /// insist their way over the other would hide it.
+    #[test]
+    fn one_console_never_preempts_another() {
+        let mut r = Router::default();
+        let a = cli(0, 1);
+        let b = cli(0, 2);
+        r.set_member(1001, a, true, 100);
+        r.set_member(1001, b, true, 100);
+
+        let t0 = std::time::Instant::now();
+        assert!(r.key_at(1001, a, t0).is_ok());
+        assert!(r.key_at(1001, b, t0).is_err());
+        assert!(r
+            .key_at(1001, b, t0 + std::time::Duration::from_millis(500))
+            .is_err());
+        assert_eq!(r.routes.get(&1001).and_then(|x| x.keyed), Some(a));
+    }
+
     /// A console subscribing to a VHF channel nobody in the world is on must
     /// still hear it as FM. This was the bug that made all three bands sound
     /// identical on a console: the route was created by the subscription, and
@@ -934,10 +1092,17 @@ mod tests {
         let console = ClientId::new(0, 1);
 
         assert_eq!(r.key(1001, unit), Ok(Keyed::Granted));
+
+        // Dispatch preempts, but only when it INSISTS. The first press is
+        // refused like anybody else's - see dispatch_is_refused_before_it_may_insist.
+        assert!(
+            r.key(1001, console).is_err(),
+            "took the channel on the first press"
+        );
         assert_eq!(
             r.key(1001, console),
             Ok(Keyed::Preempted(unit)),
-            "dispatch preempts, and says who it cut off"
+            "dispatch preempts on the second press, and says who it cut off"
         );
         assert_eq!(r.destination_of(console).map(|(t, _)| t), Some(1001));
     }
@@ -972,6 +1137,8 @@ mod tests {
         let console = ClientId::new(0, 1);
 
         r.key(1001, unit).unwrap();
+        // Refused, then insisted on: preemption takes two presses now.
+        let _ = r.key(1001, console);
         r.key(1001, console).unwrap();
 
         // The operator lets go of a button they no longer hold the channel with.
