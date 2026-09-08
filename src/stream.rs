@@ -27,12 +27,19 @@ use crate::router::ClientId;
 /// Wire format, first byte is the frame kind.
 ///
 ///   0 hello  [0][u32 sample rate BE]
-///   1 audio  [1][reserved][u16 talkgroup BE][i16 LE PCM ...]
+///   1 audio  [1][reserved][u32 talkgroup BE][i16 LE PCM ...]
 ///
-/// The audio header is padded to 4 bytes so the PCM starts 2-byte aligned.
-/// Without that pad the receiver cannot wrap it in an Int16Array at all -
-/// typed array views require their offset to be a multiple of the element
-/// size, and it throws rather than reading slowly.
+/// The talkgroup is a u32 because a CONVENTIONAL route id is one: it is
+/// `0x80000000 | frequency`, which is how a frequency and a talkgroup share an
+/// id space without colliding. It used to be written as a u16, which truncated
+/// every conventional channel to a number matching nothing - so conventional
+/// audio reached consoles addressed to a route that did not exist, and was
+/// dropped. Trunked ids fit in 16 bits, which is why only conventional broke.
+///
+/// The header is 6 bytes and that keeps the PCM 2-byte aligned. Alignment is
+/// not a nicety: typed array views require their offset to be a multiple of
+/// the element size, so an odd header makes `new Int16Array(buf, n)` throw
+/// rather than read slowly.
 pub const KIND_HELLO: u8 = 0;
 pub const KIND_AUDIO: u8 = 1;
 /// A call started or ended on a talkgroup.
@@ -42,7 +49,7 @@ pub const KIND_AUDIO: u8 = 1;
 /// the first samples shows the channel clear while somebody is already
 /// talking, and clear again in every gap between words.
 pub const KIND_CALL: u8 = 2;
-/// A transmit request was refused, and why. `[3][0][u16 tg][utf8 reason]`
+/// A transmit request was refused, and why. `[3][0][u32 tg][utf8 reason]`
 pub const KIND_DENY: u8 = 3;
 
 // Inbound, from a console. Numbered well clear of the outbound kinds so a
@@ -51,8 +58,8 @@ const TX_KEY: u8 = 16;
 const TX_UNKEY: u8 = 17;
 const TX_AUDIO: u8 = 18;
 
-/// Where the PCM starts in an audio frame.
-pub const AUDIO_HEADER: usize = 4;
+/// Where the PCM starts in an audio frame. Even, so the PCM stays alignable.
+pub const AUDIO_HEADER: usize = 6;
 
 #[derive(Default)]
 pub struct Streams {
@@ -103,10 +110,10 @@ impl Streams {
             return;
         };
 
-        let mut frame = Vec::with_capacity(4 + talker.len());
+        let mut frame = Vec::with_capacity(AUDIO_HEADER + talker.len());
         frame.push(KIND_CALL);
         frame.push(u8::from(keyed));
-        frame.extend_from_slice(&(tg as u16).to_be_bytes());
+        frame.extend_from_slice(&tg.to_be_bytes());
         frame.extend_from_slice(talker.as_bytes());
 
         let _ = sink.try_send(frame);
@@ -116,10 +123,10 @@ impl Streams {
         let Some(sink) = self.sinks.get(&client) else {
             return;
         };
-        let mut frame = Vec::with_capacity(4 + reason.len());
+        let mut frame = Vec::with_capacity(AUDIO_HEADER + reason.len());
         frame.push(KIND_DENY);
         frame.push(0);
-        frame.extend_from_slice(&(tg as u16).to_be_bytes());
+        frame.extend_from_slice(&tg.to_be_bytes());
         frame.extend_from_slice(reason.as_bytes());
         let _ = sink.try_send(frame);
     }
@@ -132,7 +139,7 @@ impl Streams {
         let mut frame = Vec::with_capacity(AUDIO_HEADER + pcm.len() * 2);
         frame.push(KIND_AUDIO);
         frame.push(0); // reserved - keeps the PCM 2-byte aligned
-        frame.extend_from_slice(&(tg as u16).to_be_bytes());
+        frame.extend_from_slice(&tg.to_be_bytes());
         for s in pcm {
             frame.extend_from_slice(&s.to_le_bytes());
         }
@@ -245,12 +252,12 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                     break;
                 }
                 let Message::Binary(buf) = msg else { continue };
-                if buf.len() < 4 {
+                if buf.len() < AUDIO_HEADER {
                     continue;
                 }
 
                 let kind = buf[0];
-                let tg = u16::from_be_bytes([buf[2], buf[3]]) as u32;
+                let tg = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
 
                 match kind {
                     TX_KEY => {
@@ -399,5 +406,85 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
             }
             println!("stream: {client} disconnected");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::ClientId;
+
+    /// A conventional route id, as `Conventional.routeId` builds one:
+    /// `0x80000000 | round(MHz * 10000)`.
+    const CONV: u32 = 0x8000_0000 | 1_552_350;
+
+    fn one_frame(build: impl FnOnce(&mut Streams, ClientId)) -> Vec<u8> {
+        let mut s = Streams::default();
+        let client = ClientId::new(0, 1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        s.sinks.insert(client, tx);
+        build(&mut s, client);
+        rx.try_recv().expect("a frame was sent")
+    }
+
+    /// The regression this exists for: the talkgroup was written as a u16, so
+    /// every conventional route truncated to a number matching nothing and its
+    /// audio was delivered addressed to a route that did not exist. Trunked
+    /// ids fit in 16 bits, which is why only conventional broke and why it
+    /// went unnoticed.
+    #[test]
+    fn a_conventional_route_survives_the_wire() {
+        let frame = one_frame(|s, c| s.send_pcm(c, CONV, &[1, -1]));
+
+        assert_eq!(frame[0], KIND_AUDIO);
+        assert_eq!(
+            u32::from_be_bytes([frame[2], frame[3], frame[4], frame[5]]),
+            CONV,
+            "a conventional id must arrive whole, not truncated to 16 bits"
+        );
+    }
+
+    #[test]
+    fn call_and_deny_carry_the_same_id_width() {
+        for frame in [
+            one_frame(|s, c| s.send_call(c, CONV, true, "unit")),
+            one_frame(|s, c| s.send_deny(c, CONV, "busy")),
+        ] {
+            assert_eq!(
+                u32::from_be_bytes([frame[2], frame[3], frame[4], frame[5]]),
+                CONV,
+            );
+        }
+    }
+
+    /// The PCM is wrapped in an Int16Array by both clients, and a typed array
+    /// view whose offset is not a multiple of its element size throws outright
+    /// rather than reading slowly. An odd header would break every listener.
+    #[test]
+    fn the_audio_header_stays_even_and_matches_the_frame() {
+        assert_eq!(AUDIO_HEADER % 2, 0, "PCM must start 2-byte aligned");
+
+        let frame = one_frame(|s, c| s.send_pcm(c, 1001, &[7, 8, 9]));
+        assert_eq!(frame.len(), AUDIO_HEADER + 3 * 2);
+
+        // Little endian, matching every tool that will ever open this.
+        assert_eq!(
+            i16::from_le_bytes([frame[AUDIO_HEADER], frame[AUDIO_HEADER + 1]]),
+            7,
+        );
+    }
+
+    /// The hello states the sample rate as a u32. A console that read it as a
+    /// u16 took the two high bytes of 8000, got zero, and divided by it.
+    #[test]
+    fn the_hello_states_the_rate_as_a_u32() {
+        let mut hello = vec![KIND_HELLO];
+        hello.extend_from_slice(&crate::dsp::RATE.to_be_bytes());
+
+        assert_eq!(hello.len(), 5);
+        assert_eq!(
+            u32::from_be_bytes([hello[1], hello[2], hello[3], hello[4]]),
+            crate::dsp::RATE,
+        );
     }
 }
