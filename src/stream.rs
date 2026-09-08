@@ -246,6 +246,8 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
             // add a round trip to every press, and push-to-talk latency is the
             // one thing a dispatcher feels immediately.
             let mut talker: Option<crate::dsp::Talker> = None;
+            const QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+            let mut quiet_since: Option<std::time::Instant> = None;
 
             while let Some(Ok(msg)) = rx_ws.next().await {
                 if msg.is_close() {
@@ -330,10 +332,32 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             r.destination_of(client)
                                 .map(|(tg, ls)| (tg, r.source_sink(tg, client), ls))
                         };
+                        // Every way this can fail says so, once a second.
+                        //
+                        // There were four silent `continue`s here and only one
+                        // of them logged. A console could transmit perfectly
+                        // into a black hole - grant accepted, frames arriving,
+                        // nothing delivered - and the node had nothing to say
+                        // about it. Diagnosing that cost an evening, so each
+                        // branch now names itself.
+                        //
+                        // Rate limited because this runs fifty times a second
+                        // and an unthrottled line would be the fault.
+                        let mut whine = |why: &str| {
+                            let now = std::time::Instant::now();
+                            let last = quiet_since.get_or_insert(now - QUIET);
+                            if now.duration_since(*last) >= QUIET {
+                                *last = now;
+                                println!("console {client} audio dropped: {why}");
+                            }
+                        };
+
                         let Some((live_tg, src, listeners)) = dest else {
+                            whine("not keyed on any route - key was lost or released");
                             continue;
                         };
                         if listeners.is_empty() {
+                            whine(&format!("nobody is listening on tg {live_tg}"));
                             continue;
                         }
 
@@ -350,7 +374,7 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             match crate::dsp::Talker::new() {
                                 Ok(t) => talker = Some(t),
                                 Err(e) => {
-                                    eprintln!("console {client}: vocoder: {e}");
+                                    println!("console {client} audio dropped: vocoder will not start: {e}");
                                     continue;
                                 }
                             }
@@ -363,14 +387,19 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                         let sinks: Vec<crate::dsp::Sink> =
                             listeners.iter().map(|l| l.sink()).collect();
                         let Some(t) = talker.as_mut() else { continue };
-                        let Ok(lanes) = t.push_pcm(&pcm, src, &sinks) else {
-                            continue;
+                        let lanes = match t.push_pcm(&pcm, src, &sinks) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                whine(&format!("vocoder refused the frame: {e}"));
+                                continue;
+                            }
                         };
 
                         let mut s = match streams.lock() {
                             Ok(g) => g,
                             Err(p) => p.into_inner(),
                         };
+                        let mut sent = 0usize;
                         for (key, pcm8) in &lanes {
                             if pcm8.is_empty() {
                                 continue;
@@ -378,8 +407,22 @@ pub async fn serve(addr: String, streams: SharedStreams, router: Shared) -> Resu
                             for l in &listeners {
                                 if crate::dsp::key_of(l.sink()) == *key {
                                     s.send_pcm(l.client, live_tg, pcm8);
+                                    sent += 1;
                                 }
                             }
+                        }
+                        drop(s);
+
+                        // Vocoded audio that matched no listener's lane. The
+                        // frame was accepted, encoded, and then quietly fitted
+                        // nobody - which is its own failure and reads exactly
+                        // like the others from outside.
+                        if sent == 0 && lanes.iter().any(|(_, p)| !p.is_empty()) {
+                            whine(&format!(
+                                "{} lane(s) encoded but matched none of {} listener(s) on tg {live_tg}",
+                                lanes.len(),
+                                listeners.len()
+                            ));
                         }
                     }
 
