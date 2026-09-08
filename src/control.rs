@@ -487,6 +487,35 @@ fn dispatch(
             None => (400, json!({ "ok": false, "error": "tg required" })),
         },
 
+        // Many member updates in one message.
+        //
+        // Link quality now moves as fast as people walk - the game models it
+        // from a coverage grid rather than assuming full quieting - so a busy
+        // server produced a control request per radio per step. Three hundred
+        // people walking is six hundred HTTP requests a second, each carrying
+        // about forty bytes of actual news, and the cost is almost entirely in
+        // the requests rather than the work.
+        //
+        // Coalesced on the sending side and applied here in one pass. The
+        // resource already batches its state reports the same way and for the
+        // same reason.
+        "tg.members" => match body.get("members").and_then(|m| m.as_array()) {
+            Some(list) => {
+                let mut applied = 0usize;
+                for m in list {
+                    let (Some(tg), Some(client)) = (u32_of(m, "tg"), client_of(server, m)) else {
+                        continue;
+                    };
+                    let listen = m.get("listen").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let quality = u32_of(m, "quality").unwrap_or(100).min(100) as u8;
+                    r.set_member(tg, client, listen, quality);
+                    applied += 1;
+                }
+                (200, json!({ "ok": true, "applied": applied }))
+            }
+            None => (400, json!({ "ok": false, "error": "members required" })),
+        },
+
         "tg.member" => match (u32_of(body, "tg"), client_of(server, body)) {
             (Some(tg), Some(client)) => {
                 let listen = body
