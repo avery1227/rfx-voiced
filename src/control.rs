@@ -262,6 +262,38 @@ fn dispatch_console(
             }
         }
 
+        // Patches, pushed rather than waited for.
+        //
+        // The node re-reads the patch list from the platform on its poll, which
+        // is sixty seconds by default. That is fine for a scheduled patch and
+        // completely wrong for a console one: a dispatcher presses PATCH
+        // because something is happening NOW, and a minute of the two channels
+        // not crossing - with the board already lit as though they do - is
+        // indistinguishable from the feature being broken. It was reported as
+        // exactly that.
+        //
+        // Replaced whole, like the polled path, because a patch that half
+        // applied is a channel joined in one direction only.
+        "patches.set" => match body.get("groups").and_then(|g| g.as_array()) {
+            Some(list) => {
+                let groups: Vec<Vec<u32>> = list
+                    .iter()
+                    .filter_map(|g| g.as_array())
+                    .map(|g| {
+                        g.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u32))
+                            .collect()
+                    })
+                    .filter(|g: &Vec<u32>| g.len() > 1)
+                    .collect();
+                let n = groups.len();
+                r.set_patches(groups);
+                println!("patches replaced: {n} group(s)");
+                (200, json!({ "ok": true, "groups": n }))
+            }
+            None => (400, json!({ "ok": false, "error": "groups required" })),
+        },
+
         "console.attach" => {
             let id = NEXT_CONSOLE.fetch_add(1, Ordering::Relaxed);
             let client = ClientId::new(CONSOLE_SERVER, id);
