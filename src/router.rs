@@ -241,13 +241,23 @@ impl Router {
     pub fn unbind(&mut self, session: SessionId) {
         if let Some(client) = self.session_to_client.remove(&session) {
             self.client_to_session.remove(&client);
-            // A player who drops cannot still hold a channel.
+            // A player who drops cannot still hold a channel - as the holder,
+            // or as somebody mixed in on top of one. `holds` counts both, so
+            // clearing only `keyed` left a departed AM doubler transmitting on
+            // an airband frequency forever: they were never in `also` when they
+            // rejoined, so nothing ever took them back out, and every word they
+            // said in proximity chat afterwards went out on that channel with
+            // no grant behind it. A conventional radio never sends an unkey
+            // when its player drops, so this is the only cleanup there is.
             for route in self.routes.values_mut() {
                 route.members.remove(&client);
+                route.also.retain(|&c| c != client);
                 if route.keyed == Some(client) {
                     route.keyed = None;
                 }
             }
+            self.keyed_by.remove(&client);
+            self.took.retain(|(c, _), _| *c != client);
         }
     }
 
@@ -258,10 +268,14 @@ impl Router {
         self.client_to_session.retain(|c, _| c.server != server);
         for route in self.routes.values_mut() {
             route.members.retain(|c, _| c.server != server);
+            // Same reasoning as `unbind`, one server at a time.
+            route.also.retain(|c| c.server != server);
             if route.keyed.map(|c| c.server) == Some(server) {
                 route.keyed = None;
             }
         }
+        self.keyed_by.retain(|c, _| c.server != server);
+        self.took.retain(|(c, _), _| c.server != server);
     }
 
     pub fn client_of(&self, session: SessionId) -> Option<ClientId> {
@@ -340,10 +354,31 @@ impl Router {
         let group = self.joined(tg);
         if group.len() > 1 {
             let outcome = self.key_one(tg, client, now)?;
+            if let Keyed::Preempted(holder) = outcome {
+                // The two-press bar was cleared for the CHANNEL, and a patch is
+                // one channel. Running the protocol again per member only
+                // re-arms `pending` and refuses - the first press armed the
+                // pressed route alone - so the preempted unit stayed keyed on
+                // every other member. Dispatch and the unit it had just cut off
+                // were then both transmitting to the same listeners, which
+                // invariant 2 says cannot happen on digital.
+                for &other in group.iter().filter(|&&t| t != tg) {
+                    if let Some(route) = self.routes.get_mut(&other) {
+                        if route.keyed == Some(holder) {
+                            route.keyed = Some(client);
+                        }
+                        // An AM member would otherwise leave the preempted unit
+                        // mixed in on top of dispatch.
+                        route.also.retain(|&c| c != holder);
+                    }
+                    self.pending.remove(&(other, client));
+                }
+            }
             for &other in group.iter().filter(|&&t| t != tg) {
                 // Best effort on the rest: a sibling that refuses is one
                 // somebody else is holding, and the caller already knows the
-                // outcome that matters.
+                // outcome that matters. Still runs after a preemption, for
+                // members the preempted unit never had.
                 let _ = self.key_one(other, client, now);
             }
             // Recorded before anything can change it. What is joined now is
@@ -474,8 +509,12 @@ impl Router {
             if route.keyed == Some(client) {
                 route.keyed = None;
             }
-            self.keyed_by.remove(&client);
         }
+        // Outside the loop: neither depends on a route, and a console that
+        // detached mid-transmission used to leave its `took` record behind for
+        // the life of the process.
+        self.keyed_by.remove(&client);
+        self.took.retain(|(c, _), _| *c != client);
     }
 
     /// What this client is keyed into, and who should hear it.
@@ -582,6 +621,26 @@ impl Router {
         let mut out: Vec<ClientId> = route.keyed.into_iter().collect();
         out.extend(route.also.iter().copied());
         out
+    }
+
+    /// Whether the channel has actually gone clear: nobody transmitting on
+    /// this route, or on anything patched to it.
+    ///
+    /// The gate on announcing a call ENDED. A release that released nothing is
+    /// routine - a preempted unit lets go of a button it no longer holds the
+    /// channel with, a refused console's page sends the unkey anyway, an AM
+    /// doubler stops talking while the first radio is still up - and ending the
+    /// call on any of those darkened every console module and finalised
+    /// somebody else's recording mid-sentence, after which the rest of their
+    /// audio was silently dropped for having no open entry.
+    ///
+    /// Across the patch group because the announcement is, and because a
+    /// best-effort sibling key can leave the surviving talker holding a joined
+    /// member rather than the route that was pressed.
+    pub fn is_clear(&self, tg: u32) -> bool {
+        self.joined(tg)
+            .iter()
+            .all(|&t| self.talkers_on(t).is_empty())
     }
 
     /// Listeners on a talkgroup and everything patched to it.
@@ -1150,6 +1209,71 @@ mod tests {
         assert!(r.key(1001, cli(A, 6)).is_ok(), "the channel is free again");
     }
 
+    /// Dropping is not only about `keyed`. A second radio on an AM frequency
+    /// transmits from `also`, and a player whose Mumble session goes away
+    /// mid-transmission never sends an unkey - a conventional radio has no
+    /// grant to release. Leaving them there meant the frequency read as
+    /// permanently colliding, and the same player rejoining (FiveM reuses
+    /// player ids) transmitted every word of their proximity chat onto it.
+    #[test]
+    fn a_dropped_am_doubler_stops_transmitting() {
+        let mut r = Router::default();
+        let air = CONV_BASE | 1_230_250;
+        r.open_conventional(air, true);
+
+        let first = cli(A, 5);
+        let doubler = cli(A, 7);
+        r.bind(sess(A, 1), "[5] First");
+        r.bind(sess(A, 2), "[7] Doubler");
+        r.set_member(air, first, true, 100);
+        r.set_member(air, doubler, true, 100);
+
+        assert_eq!(r.key(air, first), Ok(Keyed::Granted));
+        assert_eq!(r.key(air, doubler), Ok(Keyed::Mixed));
+        assert!(r.am_collision(air));
+
+        r.unbind(sess(A, 2));
+
+        assert_eq!(
+            r.destination_of(doubler),
+            None,
+            "a player who dropped was still transmitting on the frequency"
+        );
+        assert!(
+            !r.am_collision(air),
+            "the frequency read as colliding with only one radio on it"
+        );
+        assert_eq!(
+            r.talkers_on(air),
+            vec![first],
+            "the first radio is untouched"
+        );
+    }
+
+    /// The same rule when a whole tap goes away, scoped to that server.
+    #[test]
+    fn losing_a_server_takes_its_am_doublers_with_it() {
+        let mut r = Router::default();
+        let air = CONV_BASE | 1_230_250;
+        r.open_conventional(air, true);
+
+        let on_a = cli(A, 5);
+        let on_b = cli(B, 5);
+        r.set_member(air, on_a, true, 100);
+        r.set_member(air, on_b, true, 100);
+        r.key(air, on_a).unwrap();
+        assert_eq!(r.key(air, on_b), Ok(Keyed::Mixed));
+
+        r.drop_server(B);
+
+        assert_eq!(r.talkers_on(air), vec![on_a]);
+        assert_eq!(r.destination_of(on_b), None);
+        assert!(
+            r.destination_of(on_a).is_some(),
+            "the other world keeps talking"
+        );
+    }
+
     #[test]
     fn losing_one_server_leaves_the_others_alone() {
         let mut r = Router::default();
@@ -1399,6 +1523,133 @@ mod tests {
             Err("route already keyed"),
             "it is one channel now, so two people cannot both talk on it"
         );
+    }
+
+    /// A patch is one channel, so preempting it is one act. Re-running the
+    /// two-press protocol per member re-armed `pending` and refused - the first
+    /// press only ever armed the route that was pressed - so the unit dispatch
+    /// had just cut off went on holding every other member, and the two of them
+    /// were transmitting to the same listeners at once.
+    #[test]
+    fn preempting_a_patched_talkgroup_takes_every_member() {
+        let (mut r, unit, _) = patched_pair();
+        let console = cli(0, 1);
+        r.set_member(1001, console, true, 100);
+
+        r.key(1001, unit).unwrap();
+        assert!(
+            r.key(1001, console).is_err(),
+            "the first press is refused, patch or no patch"
+        );
+        assert_eq!(r.key(1001, console), Ok(Keyed::Preempted(unit)));
+
+        assert_eq!(
+            r.routes.get(&4001).and_then(|x| x.keyed),
+            Some(console),
+            "the far side of the patch was left keyed by the preempted unit"
+        );
+        assert_eq!(
+            r.destination_of(unit),
+            None,
+            "the preempted unit was still transmitting on the other half"
+        );
+        assert_eq!(r.destination_of(console).map(|(t, _)| t), Some(1001));
+    }
+
+    /// And it takes them off an AM member too, where holding is being in
+    /// `also` rather than holding `keyed`.
+    #[test]
+    fn preempting_takes_the_unit_off_a_patched_am_member() {
+        let mut r = Router::default();
+        let air = CONV_BASE | 1_230_250;
+        r.open(1001, false);
+        r.open_conventional(air, true);
+
+        let pilot = cli(A, 3);
+        let unit = cli(A, 7);
+        let console = cli(0, 1);
+        r.set_member(air, pilot, true, 100);
+        r.set_member(1001, unit, true, 100);
+        r.set_member(1001, console, true, 100);
+
+        // The pilot is already up on the frequency when the dispatcher patches
+        // it to the talkgroup, which is when a patch usually gets made. The
+        // unit then keys the trunked side and is mixed in on top of them - AM
+        // does not capture.
+        r.key(air, pilot).unwrap();
+        r.set_patches(vec![vec![1001, air]]);
+        r.key(1001, unit).unwrap();
+        assert!(r.talkers_on(air).contains(&unit));
+
+        assert!(r.key(1001, console).is_err());
+        assert_eq!(r.key(1001, console), Ok(Keyed::Preempted(unit)));
+
+        assert!(
+            !r.talkers_on(air).contains(&unit),
+            "the preempted unit was left mixed in on top of dispatch"
+        );
+        assert_eq!(r.destination_of(unit), None);
+        assert!(
+            r.talkers_on(air).contains(&pilot),
+            "the pilot was never dispatch's to preempt"
+        );
+    }
+
+    /// The gate on telling everybody a call has ended. A release that released
+    /// nothing must not end somebody else's transmission.
+    #[test]
+    fn a_channel_is_not_clear_while_anybody_is_still_up() {
+        let (mut r, unit, _) = patched_pair();
+        let console = cli(0, 1);
+        r.set_member(1001, console, true, 100);
+
+        assert!(r.is_clear(1001), "nobody has keyed anything yet");
+
+        r.key(1001, unit).unwrap();
+        assert!(r.key(1001, console).is_err());
+        r.key(1001, console).unwrap();
+
+        // The preempted unit lets go of a button it no longer holds anything
+        // with. Dispatch is mid-sentence and the channel is NOT clear.
+        assert!(!r.unkey_as(1001, unit));
+        assert!(!r.is_clear(1001));
+        assert!(
+            !r.is_clear(4001),
+            "the far side of the patch is the channel"
+        );
+
+        assert!(r.unkey_as(1001, console));
+        assert!(r.is_clear(1001));
+    }
+
+    /// AM keeps several talkers on one frequency, and one of them stopping is
+    /// not the end of the call.
+    #[test]
+    fn an_am_frequency_is_not_clear_until_the_last_radio_stops() {
+        let mut r = Router::default();
+        let air = CONV_BASE | 1_230_250;
+        r.open_conventional(air, true);
+        let (a, b) = (cli(A, 1), cli(A, 2));
+
+        r.key(air, a).unwrap();
+        assert_eq!(r.key(air, b), Ok(Keyed::Mixed));
+
+        assert!(r.unkey_as(air, b));
+        assert!(!r.is_clear(air), "the first radio is still transmitting");
+
+        assert!(r.unkey_as(air, a));
+        assert!(r.is_clear(air));
+    }
+
+    /// A route torn down mid-transmission - a codeplug reload - is clear, so
+    /// its call still gets closed rather than left open forever.
+    #[test]
+    fn a_route_that_went_away_counts_as_clear() {
+        let mut r = Router::default();
+        r.open(1001, false);
+        r.key(1001, cli(A, 5)).unwrap();
+        r.close(1001);
+        assert!(r.is_clear(1001));
     }
 
     #[test]

@@ -212,6 +212,54 @@ fn dispatch_console(
         })
         .unwrap_or_default();
 
+    // The recorder's index and one call's audio. Node-key authenticated like
+    // the rest of the console plane - a browser never reaches this directly,
+    // the platform proxies for it.
+    //
+    // Answered BEFORE the router and streams locks are taken. Neither needs
+    // them, and both do blocking disk work: index() walks every retained day
+    // directory and parses every sidecar, which on a month of recordings is
+    // tens of thousands of files. Holding the global router mutex across that
+    // blocks the per-packet destination() lookup in every Mumble tap, so one
+    // dispatcher opening instant recall stopped live audio on every enrolled
+    // world at once.
+    if path == "rec.index" {
+        let since = body.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
+        let limit = body
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(200)
+            .min(1000) as usize;
+
+        let calls = match recorder.lock() {
+            Ok(g) => g
+                .rec
+                .as_ref()
+                .map(|x| x.index(since, limit))
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        return (200, json!({ "ok": true, "calls": calls }));
+    }
+
+    if path == "rec.audio" {
+        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let pcm = match recorder.lock() {
+            Ok(g) => g.rec.as_ref().and_then(|x| x.audio(id)),
+            Err(_) => None,
+        };
+        return match pcm {
+            // Base64 rather than a binary body: this rides the same small
+            // hand-rolled HTTP as the rest of the control API, and a call
+            // is a few hundred kilobytes at most.
+            Some(bytes) => (
+                200,
+                json!({ "ok": true, "rate": crate::dsp::RATE, "pcm": b64(&bytes) }),
+            ),
+            None => (404, json!({ "ok": false, "error": "no such recording" })),
+        };
+    }
+
     let mut r = match router.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -222,46 +270,6 @@ fn dispatch_console(
     };
 
     match path {
-        // The recorder's index and one call's audio. Node-key authenticated
-        // like the rest of the console plane - a browser never reaches this
-        // directly, the platform proxies for it.
-        "rec.index" => {
-            let since = body.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
-            let limit = body
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(200)
-                .min(1000) as usize;
-
-            let calls = match recorder.lock() {
-                Ok(r) => r
-                    .rec
-                    .as_ref()
-                    .map(|x| x.index(since, limit))
-                    .unwrap_or_default(),
-                Err(_) => Vec::new(),
-            };
-            (200, json!({ "ok": true, "calls": calls }))
-        }
-
-        "rec.audio" => {
-            let id = body.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let pcm = match recorder.lock() {
-                Ok(r) => r.rec.as_ref().and_then(|x| x.audio(id)),
-                Err(_) => None,
-            };
-            match pcm {
-                // Base64 rather than a binary body: this rides the same small
-                // hand-rolled HTTP as the rest of the control API, and a call
-                // is a few hundred kilobytes at most.
-                Some(bytes) => (
-                    200,
-                    json!({ "ok": true, "rate": crate::dsp::RATE, "pcm": b64(&bytes) }),
-                ),
-                None => (404, json!({ "ok": false, "error": "no such recording" })),
-            }
-        }
-
         // Patches, pushed rather than waited for.
         //
         // The node re-reads the patch list from the platform on its poll, which
@@ -598,10 +606,6 @@ fn dispatch(
 
         "unkey" => match u32_of(body, "tg") {
             Some(tg) => {
-                announce_call(&r, streams, tg, false, "");
-                if let Ok(mut rec) = recorder.lock() {
-                    rec.end(tg);
-                }
                 // Scoped to the caller when it names one: dispatch can preempt a
                 // unit, and the preempted unit still sends its own unkey.
                 match client_of(server, body) {
@@ -609,6 +613,34 @@ fn dispatch(
                         r.unkey_as(tg, c);
                     }
                     None => r.unkey(tg),
+                }
+                // AFTER the release, and only once the channel has actually
+                // gone clear. Announcing first ended the call for a release
+                // that released nothing: a preempted unit letting go darkened
+                // every console module while dispatch was mid-sentence and
+                // closed dispatch's recording, after which the rest of it was
+                // dropped for having no open entry. The AM case contradicted
+                // the key path outright - a Mixed talker deliberately does not
+                // start a call, and then ended the first talker's.
+                //
+                // Not conditioned on what unkey_as returns: when the router
+                // lost the key first - a Mumble drop, an unkey after a node
+                // restart - nothing was released and nobody is talking, and the
+                // call-end still has to go out or the module stays lit.
+                //
+                // Two different questions, deliberately. A recording is keyed
+                // by ROUTE and ends when that route goes quiet. The indication
+                // covers the whole patch group, like the announcement itself,
+                // because a patch made mid-incident can leave two people
+                // holding two members of one channel - and a module must stay
+                // lit while either of them is still talking.
+                if r.talkers_on(tg).is_empty() {
+                    if let Ok(mut rec) = recorder.lock() {
+                        rec.end(tg);
+                    }
+                }
+                if r.is_clear(tg) {
+                    announce_call(&r, streams, tg, false, "");
                 }
                 println!("UNKEY        tg {tg}");
                 (200, json!({ "ok": true }))
@@ -692,4 +724,145 @@ async fn respond(socket: &mut TcpStream, code: u16, body: &Value) -> Result<()> 
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream::{Streams, KIND_CALL};
+
+    const FIELD: u32 = 1;
+
+    struct Node {
+        router: Shared,
+        streams: SharedStreams,
+        recorder: crate::recorder::SharedRecorder,
+    }
+
+    fn node() -> Node {
+        Node {
+            router: Arc::new(Mutex::new(Router::default())),
+            streams: Arc::new(Mutex::new(Streams::default())),
+            recorder: crate::recorder::SharedRecorder::default(),
+        }
+    }
+
+    /// Whether a call frame said the channel was keyed, in the order they
+    /// arrived.
+    fn calls(rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Vec<bool> {
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            if f[0] == KIND_CALL {
+                out.push(f[1] == 1);
+            }
+        }
+        out
+    }
+
+    /// The preempted unit still sends its own unkey when its operator lets go,
+    /// and that must not end the transmission that took the channel off them.
+    ///
+    /// This used to announce the call ended and finalise the recording BEFORE
+    /// asking the router whether anything was actually released - so every
+    /// console module went dark mid-sentence, and the rest of what dispatch
+    /// said was dropped for having no open recording to go into.
+    #[test]
+    fn a_preempted_units_unkey_does_not_end_dispatch() {
+        let n = node();
+        let unit = ClientId::new(FIELD, 7);
+        let console = ClientId::new(CONSOLE_SERVER, 1);
+
+        let mut rx = {
+            let mut r = n.router.lock().unwrap();
+            r.open(1001, false);
+            r.set_member(1001, unit, true, 100);
+            r.set_member(1001, console, true, 100);
+            r.key(1001, unit).unwrap();
+            // Refused, then insisted on: preemption takes two presses.
+            assert!(r.key(1001, console).is_err());
+            r.key(1001, console).unwrap();
+            n.streams.lock().unwrap().test_sink(console)
+        };
+
+        let (code, _) = dispatch(
+            "unkey",
+            &json!({ "tg": 1001, "client": 7 }),
+            FIELD,
+            &n.router,
+            &n.streams,
+            &n.recorder,
+        );
+
+        assert_eq!(code, 200);
+        assert!(
+            calls(&mut rx).is_empty(),
+            "the unit that was cut off ended dispatch's call by letting go"
+        );
+        assert_eq!(
+            n.router
+                .lock()
+                .unwrap()
+                .destination_of(console)
+                .map(|(t, _)| t),
+            Some(1001),
+            "dispatch is still transmitting"
+        );
+    }
+
+    /// And the ordinary case still works, or the fix above would simply have
+    /// left every module lit forever.
+    #[test]
+    fn an_ordinary_unkey_still_ends_the_call() {
+        let n = node();
+        let unit = ClientId::new(FIELD, 7);
+        let console = ClientId::new(CONSOLE_SERVER, 1);
+
+        let mut rx = {
+            let mut r = n.router.lock().unwrap();
+            r.open(1001, false);
+            r.set_member(1001, unit, true, 100);
+            r.set_member(1001, console, true, 100);
+            n.streams.lock().unwrap().test_sink(console)
+        };
+
+        let body = json!({ "tg": 1001, "client": 7, "unit": "ENG 1" });
+        dispatch("key", &body, FIELD, &n.router, &n.streams, &n.recorder);
+        dispatch("unkey", &body, FIELD, &n.router, &n.streams, &n.recorder);
+
+        assert_eq!(calls(&mut rx), vec![true, false]);
+    }
+
+    /// Instant recall walks the whole recording store, and it used to do that
+    /// with the global router mutex held - so a read-only query from one
+    /// dispatcher stalled routing for every player on every enrolled world.
+    #[test]
+    fn a_recall_query_does_not_wait_for_the_router() {
+        let n = node();
+        let held = n.router.lock().unwrap();
+
+        let (router, streams, recorder) = (n.router.clone(), n.streams.clone(), n.recorder.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let answered = dispatch_console(
+                "rec.index",
+                &json!({ "since": 0, "limit": 10 }),
+                &router,
+                &streams,
+                &recorder,
+            );
+            let _ = tx.send(answered.0);
+        });
+
+        // Generous: the point is that it never waits at all, not that it is
+        // fast.
+        let code = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(
+            code.ok(),
+            Some(200),
+            "the recorder index blocked on the router lock"
+        );
+
+        drop(held);
+        worker.join().unwrap();
+    }
 }

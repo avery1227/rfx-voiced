@@ -74,6 +74,56 @@ fn consoles_on(r: &crate::router::Router, tg: u32) -> Vec<crate::router::ClientI
         .collect()
 }
 
+/// What a release left behind.
+struct Released {
+    /// Nobody is transmitting on the ROUTE any more, so its recording can be
+    /// finalised. A recording is keyed by route, so this is the question that
+    /// decides it.
+    recording_over: bool,
+    /// And nobody on anything patched to it either, so the call is over for
+    /// every console watching. Wider than the recording deliberately: a patch
+    /// made mid-incident can leave two people holding two members of what is
+    /// now one channel, and a module must stay lit while either is talking.
+    call_over: bool,
+    watching: Vec<ClientId>,
+}
+
+/// A console letting go of PTT: release whatever it holds, and say what that
+/// left behind.
+///
+/// `unkey_as` rather than `unkey` because a release for somebody else's call
+/// would be a console cutting off a field unit by asking nicely - and a console
+/// that was REFUSED still sends TX_UNKEY when its operator lets the button go,
+/// so this runs for calls the sender never held. Ending those cleared every
+/// board and finalised the real talker's recording mid-sentence.
+///
+/// The router is asked what is left rather than `unkey_as` being believed: they
+/// answer different questions, and a route torn down mid-transmission - a
+/// codeplug reload - released nothing and yet must still close its recording,
+/// or the call stays open forever and never appears in recall at all.
+fn release_key(r: &mut crate::router::Router, tg: u32, client: ClientId) -> Released {
+    r.unkey_as(tg, client);
+    Released {
+        recording_over: r.talkers_on(tg).is_empty(),
+        call_over: r.is_clear(tg),
+        watching: consoles_on(r, tg),
+    }
+}
+
+/// A socket going away mid-transmission, which must not leave the talkgroup
+/// keyed against everybody else on it.
+///
+/// Scoped to the client for the same reason as `release_key`, and because a
+/// bare `unkey` gives back only the route that was pressed: a console that
+/// keyed a patched talkgroup and then closed its tab left every other member
+/// keyed by an id that is never reissued, so nobody could use them again short
+/// of restarting the node.
+fn release_on_drop(r: &mut crate::router::Router, client: ClientId) -> Option<(u32, bool)> {
+    let (tg, _) = r.destination_of(client)?;
+    r.unkey_as(tg, client);
+    Some((tg, r.talkers_on(tg).is_empty()))
+}
+
 #[derive(Default)]
 pub struct Streams {
     /// token -> client, minted by FXServer.
@@ -83,6 +133,17 @@ pub struct Streams {
 }
 
 pub type SharedStreams = Arc<Mutex<Streams>>;
+
+/// A socket that keeps whatever was sent to it, so a test in another module
+/// can see what a console was actually told rather than inferring it.
+#[cfg(test)]
+impl Streams {
+    pub fn test_sink(&mut self, client: ClientId) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel(16);
+        self.sinks.insert(client, tx);
+        rx
+    }
+}
 
 impl Streams {
     pub fn authorize(&mut self, token: String, client: ClientId) {
@@ -352,29 +413,28 @@ pub async fn serve(
                     }
 
                     TX_UNKEY => {
-                        let watching = {
+                        let done = {
                             let mut r = match router.lock() {
                                 Ok(g) => g,
                                 Err(p) => p.into_inner(),
                             };
-                            // Only release what we actually hold. An unkey for
-                            // somebody else's call would be a console able to
-                            // cut off a field unit by asking nicely.
-                            r.unkey_as(tg, client);
-                            consoles_on(&r, tg)
+                            release_key(&mut r, tg, client)
                         };
-                        let mut s = match streams.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
-                        for c in &watching {
-                            s.send_call(*c, tg, false, "");
+                        if done.call_over {
+                            let mut s = match streams.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            for c in &done.watching {
+                                s.send_call(*c, tg, false, "");
+                            }
+                            s.send_call(client, tg, false, "");
+                            drop(s);
                         }
-                        s.send_call(client, tg, false, "");
-                        drop(s);
-
-                        if let Ok(mut rec) = recorder.lock() {
-                            rec.end(tg);
+                        if done.recording_over {
+                            if let Ok(mut rec) = recorder.lock() {
+                                rec.end(tg);
+                            }
                         }
                     }
 
@@ -511,15 +571,19 @@ pub async fn serve(
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                if let Some((tg, _)) = r.destination_of(client) {
+                if let Some((tg, ended)) = release_on_drop(&mut r, client) {
                     println!("console {client} dropped while keyed on tg {tg}");
-                    r.unkey(tg);
                     drop(r);
                     // Otherwise the call stays open forever and never appears
                     // in recall at all - the recording is only written when it
-                    // ends.
-                    if let Ok(mut rec) = recorder.lock() {
-                        rec.end(tg);
+                    // ends. Only once the route has actually gone quiet,
+                    // though: on an AM frequency the departing console may have
+                    // been mixed in on top of somebody who is still talking,
+                    // and that is still their call.
+                    if ended {
+                        if let Ok(mut rec) = recorder.lock() {
+                            rec.end(tg);
+                        }
                     }
                 }
             }
@@ -595,6 +659,121 @@ mod tests {
         assert_eq!(
             i16::from_le_bytes([frame[AUDIO_HEADER], frame[AUDIO_HEADER + 1]]),
             7,
+        );
+    }
+
+    /// A console that was refused still sends TX_UNKEY when its operator lets
+    /// the button go - the page adds the talkgroup to its keyed set
+    /// optimistically and the deny does not take it back out. Ending the call
+    /// on that finalised the real talker's recording mid-sentence and showed
+    /// every board clear while they were still speaking.
+    #[test]
+    fn a_refused_consoles_release_does_not_end_somebody_elses_call() {
+        let mut r = crate::router::Router::default();
+        let unit = ClientId::new(1, 7);
+        let refused = ClientId::new(crate::control::CONSOLE_SERVER, 2);
+
+        r.open(1001, false);
+        r.set_member(1001, unit, true, 100);
+        r.set_member(1001, refused, true, 100);
+        r.key(1001, unit).unwrap();
+        assert!(r.key(1001, refused).is_err(), "the first press is refused");
+
+        let done = release_key(&mut r, 1001, refused);
+        assert!(!done.call_over, "the unit is still talking");
+        assert!(!done.recording_over, "the unit's recording was finalised");
+        assert_eq!(
+            r.destination_of(unit).map(|(t, _)| t),
+            Some(1001),
+            "a console released a call it never held"
+        );
+
+        // And the holder letting go does end it, or nothing would ever close.
+        let done = release_key(&mut r, 1001, unit);
+        assert!(done.call_over && done.recording_over);
+    }
+
+    /// A route torn down mid-transmission releases nothing, and still has to
+    /// end its call: a recording is only written when it ends, so one left open
+    /// never appears in recall at all.
+    #[test]
+    fn a_release_against_a_route_that_went_away_still_ends_the_call() {
+        let mut r = crate::router::Router::default();
+        let console = ClientId::new(crate::control::CONSOLE_SERVER, 1);
+        r.open(1001, false);
+        r.key(1001, console).unwrap();
+
+        r.close(1001); // a codeplug reload, while the button is down
+        let done = release_key(&mut r, 1001, console);
+        assert!(done.recording_over && done.call_over);
+    }
+
+    /// A patch made while somebody is already talking leaves two people holding
+    /// two members of what is now one channel. The one who lets go first ends
+    /// their own recording - it is keyed by route - but the channel is not
+    /// clear, so the boards stay lit for the one still talking.
+    #[test]
+    fn a_second_holder_in_the_group_keeps_the_channel_busy() {
+        let mut r = crate::router::Router::default();
+        let first = ClientId::new(1, 7);
+        let second = ClientId::new(1, 8);
+
+        r.open(1001, false);
+        r.open(4001, false);
+        r.key(1001, first).unwrap();
+        // The dispatcher patches them together mid-incident, and somebody keys
+        // the other side before the first has finished.
+        r.set_patches(vec![vec![1001, 4001]]);
+        r.key(4001, second).unwrap();
+
+        let done = release_key(&mut r, 1001, first);
+        assert!(
+            done.recording_over,
+            "the first talker's recording would never be written"
+        );
+        assert!(!done.call_over, "somebody is still on the channel");
+    }
+
+    /// A closed browser tab gives back everything that key took, not just the
+    /// route that was pressed. Console ids are never reissued, so a patch
+    /// member left keyed by one is unusable until the node restarts.
+    #[test]
+    fn a_dropped_console_gives_back_every_patched_route() {
+        let mut r = crate::router::Router::default();
+        let console = ClientId::new(crate::control::CONSOLE_SERVER, 1);
+        let unit = ClientId::new(1, 7);
+
+        r.open(1001, false);
+        r.open(4001, false);
+        r.set_patches(vec![vec![1001, 4001]]);
+        r.set_member(1001, console, true, 100);
+        r.key(1001, console).unwrap();
+
+        assert_eq!(release_on_drop(&mut r, console), Some((1001, true)));
+        assert!(
+            r.key(4001, unit).is_ok(),
+            "the far side of the patch was stranded keyed by a console that is gone"
+        );
+    }
+
+    /// And it takes nothing from anybody else: on AM the departing radio may
+    /// have been one of several on the frequency.
+    #[test]
+    fn a_dropped_am_console_leaves_the_other_radios_up() {
+        let mut r = crate::router::Router::default();
+        let air = 0x8000_0000 | 1_230_250;
+        let console = ClientId::new(crate::control::CONSOLE_SERVER, 1);
+        let pilot = ClientId::new(1, 7);
+
+        r.open_conventional(air, true);
+        r.key(air, pilot).unwrap();
+        r.key(air, console).unwrap(); // Mixed, on top of the pilot
+
+        assert_eq!(release_on_drop(&mut r, console), Some((air, false)));
+        assert_eq!(
+            r.talkers_on(air),
+            vec![pilot],
+            "a dropped console cut off everybody else on the frequency"
         );
     }
 

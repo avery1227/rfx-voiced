@@ -196,6 +196,72 @@ fn frame(kind: u16, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The Mumble protocol caps a control message at 8 MiB, and nothing this tap
+/// parses comes near it.
+const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+/// The inbound half of `frame`, read a piece at a time.
+///
+/// It exists as a struct because the read loop races the talkspurt sweep in a
+/// `select!`, and `read_exact` is NOT cancellation safe: its count of bytes
+/// already taken lives inside the future, so a sweep tick landing between the
+/// two halves of a header split across TLS records dropped that future and lost
+/// those bytes for good. The next header was then read out of the middle of a
+/// message and every frame after it was garbage - the tap died on a decode
+/// error at best, and audio for that whole FXServer stopped until the reconnect.
+///
+/// Keeping the fill count out here fixes that, because `read` IS cancel safe:
+/// cancelled, it has read nothing, and what we already had is still counted.
+#[derive(Default)]
+struct Header {
+    buf: [u8; 6],
+    fill: usize,
+}
+
+impl Header {
+    /// One cancellable step. `Some((kind, len))` once six bytes are in hand,
+    /// `None` while it is still short.
+    ///
+    /// The single await is the only cancellation point, and nothing has been
+    /// consumed when it is reached.
+    async fn read_from<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        rd: &mut R,
+    ) -> Result<Option<(u16, usize)>> {
+        // fill is always < 6 here, so the slice is never empty and a zero-byte
+        // read really does mean the far end has gone.
+        let n = rd
+            .read(&mut self.buf[self.fill..])
+            .await
+            .context("connection closed by server")?;
+        if n == 0 {
+            anyhow::bail!("connection closed by server");
+        }
+        self.fill += n;
+        if self.fill < 6 {
+            return Ok(None);
+        }
+        self.fill = 0;
+
+        let kind = u16::from_be_bytes([self.buf[0], self.buf[1]]);
+        let len = u32::from_be_bytes([self.buf[2], self.buf[3], self.buf[4], self.buf[5]]) as usize;
+
+        // Refuse an impossible length BEFORE anybody allocates for it. A
+        // desynchronised or hostile stream can name 4 GiB here, and that either
+        // fails - an allocation failure in Rust aborts the process, taking every
+        // other tap, the control API and all audio with it - or succeeds and
+        // wedges the read in a body that will never arrive, since there is no
+        // read timeout. There is no safe place to resynchronise to either, so
+        // this is fatal to the connection by design: the supervisor drops this
+        // server's routes and redials in three seconds.
+        if len > MAX_FRAME {
+            anyhow::bail!("oversized mumble frame: kind {kind}, {len} bytes");
+        }
+
+        Ok(Some((kind, len)))
+    }
+}
+
 pub fn install_crypto_provider() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -320,7 +386,7 @@ pub async fn run(
     let mut sweep = tokio::time::interval(Duration::from_millis(50));
     sweep.tick().await;
 
-    let mut header = [0u8; 6];
+    let mut header = Header::default();
 
     loop {
         tokio::select! {
@@ -340,11 +406,10 @@ pub async fn run(
                 }
             }
 
-            read = rd.read_exact(&mut header) => {
-                read.context("connection closed by server")?;
-
-                let kind = u16::from_be_bytes([header[0], header[1]]);
-                let len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            read = header.read_from(&mut rd) => {
+                // Short of a whole header. What arrived is held for the next
+                // pass rather than being read again from the start.
+                let Some((kind, len)) = read? else { continue };
 
                 let mut body = vec![0u8; len];
                 rd.read_exact(&mut body).await.context("short read")?;
@@ -596,5 +661,91 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// A header arriving in two pieces is one header. Murmur coalesces queued
+    /// messages into TLS records and anything over 16 KiB forces a split, so a
+    /// six-byte header straddling a record boundary is ordinary traffic on a
+    /// busy server rather than a curiosity.
+    #[tokio::test]
+    async fn a_header_split_across_reads_is_still_one_header() {
+        let (mut server, mut tap) = tokio::io::duplex(64);
+        let mut header = Header::default();
+
+        server.write_all(&[0, 5, 0]).await.unwrap();
+        assert_eq!(header.read_from(&mut tap).await.unwrap(), None);
+
+        server.write_all(&[0, 0, 42]).await.unwrap();
+        assert_eq!(header.read_from(&mut tap).await.unwrap(), Some((5, 42)));
+    }
+
+    /// And the half already taken survives the sweep tick cancelling the read.
+    /// This is the whole reason the fill count lives outside the future: with
+    /// `read_exact` those three bytes were gone, the next header was parsed out
+    /// of the middle of a message, and every frame afterwards was garbage.
+    #[tokio::test]
+    async fn a_cancelled_header_read_keeps_what_it_already_took() {
+        let (mut server, mut tap) = tokio::io::duplex(64);
+        let mut header = Header::default();
+
+        server.write_all(&[0, 5, 0]).await.unwrap();
+        // The 50 ms talkspurt sweep fires while the header is half read, and
+        // the read future is dropped where it stands.
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), async {
+            loop {
+                if header.read_from(&mut tap).await.unwrap().is_some() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(cancelled.is_err(), "the header completed early");
+
+        server.write_all(&[0, 0, 42]).await.unwrap();
+        let resumed = tokio::time::timeout(Duration::from_millis(500), header.read_from(&mut tap))
+            .await
+            .expect("the framing desynchronised - the first three bytes were lost");
+        assert_eq!(resumed.unwrap(), Some((5, 42)));
+    }
+
+    /// A length off a desynchronised or hostile stream is refused before
+    /// anything allocates for it. Failing an allocation aborts the process,
+    /// which would take every other tap and the control API down with it.
+    #[tokio::test]
+    async fn an_impossible_frame_length_is_refused_rather_than_allocated() {
+        let (mut server, mut tap) = tokio::io::duplex(64);
+        let mut header = Header::default();
+
+        server
+            .write_all(&[0, 5, 0xff, 0xff, 0xff, 0xff])
+            .await
+            .unwrap();
+        let err = header
+            .read_from(&mut tap)
+            .await
+            .expect_err("a 4 GiB frame was accepted");
+        assert!(err.to_string().contains("oversized"), "{err}");
+    }
+
+    /// The cap is Mumble's own, and everything this tap actually parses fits
+    /// inside it with room to spare.
+    #[tokio::test]
+    async fn a_frame_at_the_limit_is_still_accepted() {
+        let (mut server, mut tap) = tokio::io::duplex(64);
+        let mut header = Header::default();
+
+        let mut h = vec![0, 7];
+        h.extend_from_slice(&(MAX_FRAME as u32).to_be_bytes());
+        server.write_all(&h).await.unwrap();
+        assert_eq!(
+            header.read_from(&mut tap).await.unwrap(),
+            Some((7, MAX_FRAME))
+        );
     }
 }
