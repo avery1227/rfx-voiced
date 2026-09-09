@@ -119,6 +119,29 @@ pub struct Route {
     /// Only ever populated on an AM route. Everywhere else a route has exactly
     /// one holder by construction, and this stays empty.
     pub also: Vec<ClientId>,
+    /// Quality updates we were told about while somebody was transmitting, and
+    /// deliberately have not acted on yet.
+    ///
+    /// THE VOCODER LANE IS CHOSEN IN `dsp::key_of`, as `lane_of(quality)`, per
+    /// listener per packet - and `Member.quality` below is the only thing that
+    /// ever reaches it. So a link that wanders across a `LANE_STEP` boundary
+    /// mid-word hands that listener a different `Leg`: a different Codec2
+    /// encoder and decoder with their own previous frame, their own noise
+    /// generator, and a speaker whose biquads start from zeroed history. The
+    /// swap is heard as a click, a warble, or a restarted chunk of a word.
+    ///
+    /// `dsp` cannot fix it - `Talker` is handed a bare `&[Sink]` and cannot
+    /// tell a drifting listener from a second listener - and neither can the
+    /// resource, because talkgroups are global and the FXServer holding a
+    /// listener has no idea whether somebody on another server has the channel.
+    /// This is the only place with listener identity that also knows whether a
+    /// transmission is in progress.
+    ///
+    /// A value parked here is a quality the node has already been told. It is
+    /// applied when the channel goes clear, or dropped when the client goes
+    /// away. It is never rendered from and never becomes a lane of its own, so
+    /// the set of renderings stays the 21 lanes it has always been.
+    deferred: HashMap<ClientId, u8>,
 }
 
 /// Conventional routes carry the high bit. That is not a convention this file
@@ -145,6 +168,32 @@ fn classify(id: u32) -> (bool, bool) {
     }
     let mhz = (id & !CONV_BASE) as f32 / 10_000.0;
     (true, (108.0..137.0).contains(&mhz))
+}
+
+/// Whether a quality update is boundary jitter rather than real movement.
+///
+/// True only when the two values render exactly one `LANE_STEP` apart. Leaving
+/// the lane you are on therefore costs more than the step that put you next to
+/// its edge, so a link oscillating over one cell boundary - the 92/93 pair
+/// `dsp` pins a test on - never moves anybody at all.
+///
+/// A deadband rather than a latch for the whole transmission, because
+/// `destination` is resolved per packet precisely so that somebody driving out
+/// of range is HEARD going. A real slide from 100 to 70 still steps down; it
+/// arrives one lane behind, which is five quality points, the finest
+/// distinction the system claims to render in the first place.
+///
+/// Silence is the exception and is never held back. The test is the MUTED flag
+/// and not a `DECODE_FLOOR` comparison, because lanes 0 and 5 are both silent:
+/// the audible boundary sits between quality 7 and 8, one lane apart, and a
+/// `DECODE_FLOOR` test would let a radio coming back into range be deferred
+/// and stay silent for the rest of somebody's transmission.
+fn jitters_one_lane(was: u8, now: u8) -> bool {
+    let (a, b) = (crate::dsp::lane_of(was), crate::dsp::lane_of(now));
+    if crate::dsp::profile(a).muted != crate::dsp::profile(b).muted {
+        return false;
+    }
+    a.abs_diff(b) == crate::dsp::LANE_STEP
 }
 
 impl Route {
@@ -313,7 +362,25 @@ impl Router {
         self.routes.remove(&tg).is_some()
     }
 
+    /// Membership and link quality: the one door quality enters the node
+    /// through, and so the one place lane hysteresis can live.
+    ///
+    /// `listen` is applied immediately and always. It is not a rendering - it
+    /// is whether the audio is transmitted at all, which is how encryption and
+    /// out-of-coverage are enforced - and holding it back would keep sending
+    /// audio to somebody who has just lost the right to hear it.
+    ///
+    /// Quality is deadbanded while somebody is talking; see `Route::deferred`.
+    /// Nothing is held back on an idle channel, so a listener whose link is
+    /// steady is stored, and rendered, exactly as they were before this
+    /// existed.
     pub fn set_member(&mut self, tg: u32, client: ClientId, listen: bool, quality: u8) {
+        // Across the patch group, and read before the route is borrowed: a
+        // patched sibling being keyed IS this channel being keyed as far as
+        // anybody listening on it is concerned, and their decoder chain flaps
+        // just the same.
+        let busy = !self.is_clear(tg);
+
         let route = self.routes.entry(tg).or_insert_with(|| {
             // Classified on creation. A console subscribing is usually the
             // first thing to touch a route, and a route that defaulted to
@@ -327,7 +394,35 @@ impl Router {
                 ..Default::default()
             }
         });
-        route.members.insert(client, Member { listen, quality });
+
+        let hold = route
+            .members
+            .get(&client)
+            .map(|m| m.quality)
+            .filter(|&was| busy && jitters_one_lane(was, quality));
+
+        match hold {
+            // Keep serving them the lane they are already being decoded on,
+            // and remember what we were told so the release can act on it.
+            Some(was) => {
+                route.members.insert(
+                    client,
+                    Member {
+                        listen,
+                        quality: was,
+                    },
+                );
+                route.deferred.insert(client, quality);
+            }
+            // Everything else applies verbatim, and this path is byte for byte
+            // what it always did: a member we have never seen, an idle
+            // channel, the same lane, movement of more than one lane, or a
+            // change between silence and audio.
+            None => {
+                route.members.insert(client, Member { listen, quality });
+                route.deferred.remove(&client);
+            }
+        }
     }
 
     /// Returns Err with a reason if the grant is refused.
@@ -499,12 +594,16 @@ impl Router {
     pub fn forget_membership(&mut self, client: ClientId) {
         for route in self.routes.values_mut() {
             route.members.remove(&client);
+            // Or a parked quality outlives the membership it belongs to and is
+            // applied to whatever the client rejoins as at the next release.
+            route.deferred.remove(&client);
         }
     }
 
     pub fn forget_client(&mut self, client: ClientId) {
         for route in self.routes.values_mut() {
             route.members.remove(&client);
+            route.deferred.remove(&client);
             route.also.retain(|&c| c != client);
             if route.keyed == Some(client) {
                 route.keyed = None;
@@ -726,7 +825,7 @@ impl Router {
             .remove(&(client, tg))
             .unwrap_or_else(|| self.joined(tg));
 
-        for other in mine {
+        for &other in &mine {
             if let Some(route) = self.routes.get_mut(&other) {
                 if route.also.contains(&client) {
                     route.also.retain(|&c| c != client);
@@ -739,6 +838,9 @@ impl Router {
             }
         }
         self.keyed_by.remove(&client);
+        for other in mine {
+            self.drain_deferred(other);
+        }
         released
     }
 
@@ -747,6 +849,35 @@ impl Router {
         if let Some(route) = self.routes.get_mut(&tg) {
             route.keyed = None;
             route.also.clear();
+        }
+        self.drain_deferred(tg);
+    }
+
+    /// Applies the quality updates parked by `set_member` during a
+    /// transmission, now that the channel has actually gone clear.
+    ///
+    /// Gated on `is_clear` across the group for the same reason the deferral
+    /// is taken across it: an AM doubler letting go while the other radio is
+    /// still up has not ended anything, and draining there would move a lane
+    /// mid-word on the transmission that is still running.
+    ///
+    /// This is what stops one lane of lag compounding into two. The next
+    /// transmission starts on exactly `lane_of(quality)` for the last quality
+    /// the node was told, so the hysteresis costs a lane WITHIN a call and
+    /// nothing at all between calls.
+    fn drain_deferred(&mut self, tg: u32) {
+        if !self.is_clear(tg) {
+            return;
+        }
+        for t in self.joined(tg) {
+            let Some(route) = self.routes.get_mut(&t) else {
+                continue;
+            };
+            for (client, quality) in route.deferred.drain() {
+                if let Some(m) = route.members.get_mut(&client) {
+                    m.quality = quality;
+                }
+            }
         }
     }
 
@@ -1703,6 +1834,181 @@ mod tests {
                 .map(|l| l.quality),
             Some(90),
             "the better link wins - they hear it once, as well as they can"
+        );
+    }
+
+    // -- vocoder lane hysteresis --------------------------------------------
+
+    /// Somebody talking, and one unit listening on a link we can wobble. This
+    /// is the whole situation lane hysteresis exists for: quality only ever
+    /// changes mid-transmission because the game models coverage from where
+    /// people are standing, and people keep walking while they listen.
+    fn mid_transmission(quality: u8) -> (Router, ClientId, ClientId) {
+        let mut r = Router::default();
+        r.open(1001, false);
+        let talking = cli(A, 1);
+        let hearing = cli(A, 2);
+        r.set_member(1001, talking, true, 100);
+        r.set_member(1001, hearing, true, quality);
+        r.key(1001, talking).unwrap();
+        (r, talking, hearing)
+    }
+
+    /// The quality the listener is actually being RENDERED at, which is the
+    /// only number that decides anything - reading `members` directly would
+    /// pass while the audio was still wrong.
+    fn heard_at(r: &Router, talking: ClientId, hearing: ClientId) -> u8 {
+        let (_, listeners) = r.destination_of(talking).expect("keyed");
+        listeners
+            .iter()
+            .find(|l| l.client == hearing)
+            .expect("still a listener")
+            .quality
+    }
+
+    /// The defect. 92 and 93 are one point apart and fall either side of a
+    /// `LANE_STEP` boundary, so a listener sitting on it was walked onto a
+    /// different Codec2 chain and back again by every coverage update - mid
+    /// word, with zeroed or stale decoder state each time.
+    #[test]
+    fn a_link_jittering_over_a_lane_edge_stays_on_one_decoder() {
+        let (mut r, talking, hearing) = mid_transmission(93);
+        let started = crate::dsp::lane_of(heard_at(&r, talking, hearing));
+
+        for q in [92, 93, 92, 93, 92] {
+            r.set_member(1001, hearing, true, q);
+            assert_eq!(
+                crate::dsp::lane_of(heard_at(&r, talking, hearing)),
+                started,
+                "quality {q} moved them onto another vocoder lane mid-transmission"
+            );
+        }
+    }
+
+    /// And it is a deadband, not a latch. Somebody driving out of range while
+    /// the channel is up has to be heard going: that is why the destination is
+    /// resolved per packet in the first place, and a hysteresis that froze the
+    /// lane for the whole call would quietly undo it.
+    #[test]
+    fn a_link_that_really_slides_still_steps_down_mid_transmission() {
+        let (mut r, talking, hearing) = mid_transmission(100);
+        r.set_member(1001, hearing, true, 88);
+        assert_eq!(
+            crate::dsp::lane_of(heard_at(&r, talking, hearing)),
+            crate::dsp::lane_of(88),
+            "two lanes is movement, not jitter, and has to be heard"
+        );
+    }
+
+    /// Lanes 0 and 5 are BOTH silent, so the silent-to-audible boundary sits
+    /// between quality 7 and 8 - one lane, which a plain deadband would
+    /// swallow. A radio driving back into range would then stay dead for the
+    /// rest of the transmission, which is worse than any click.
+    #[test]
+    fn a_radio_coming_back_into_range_is_heard_at_once() {
+        let (mut r, talking, hearing) = mid_transmission(7);
+        assert!(
+            crate::dsp::profile(crate::dsp::lane_of(7)).muted,
+            "7 is under the floor once it is quantised"
+        );
+
+        r.set_member(1001, hearing, true, 9);
+        let lane = crate::dsp::lane_of(heard_at(&r, talking, hearing));
+        assert!(
+            !crate::dsp::profile(lane).muted,
+            "they came back into range and were left muted for the whole call"
+        );
+    }
+
+    /// One lane of lag is the price for the call it happens on, and must not
+    /// compound: what the node was last told is applied the moment the channel
+    /// goes clear, so the next transmission starts on the exact lane.
+    #[test]
+    fn a_held_back_quality_lands_when_the_channel_goes_clear() {
+        let (mut r, talking, hearing) = mid_transmission(93);
+
+        r.set_member(1001, hearing, true, 92);
+        assert_eq!(
+            heard_at(&r, talking, hearing),
+            93,
+            "the swap was allowed to happen mid-transmission"
+        );
+
+        r.unkey_as(1001, talking);
+        r.key(1001, talking).unwrap();
+        assert_eq!(
+            heard_at(&r, talking, hearing),
+            92,
+            "a lane of lag survived the release and compounded into the next call"
+        );
+    }
+
+    /// The property that matters most, and the one a careless fix breaks: with
+    /// nobody talking, quality is stored exactly as it arrives. A listener
+    /// whose link is steady therefore lands on precisely the lane they landed
+    /// on before any of this existed.
+    #[test]
+    fn a_quality_update_with_nobody_talking_is_applied_verbatim() {
+        let mut r = Router::default();
+        r.open(1001, false);
+        let talking = cli(A, 1);
+        let hearing = cli(A, 2);
+        r.set_member(1001, talking, true, 100);
+
+        // Every kind of step, including the one-lane ones a live channel would
+        // hold back, and the pair either side of the silence boundary.
+        for q in [93, 92, 93, 41, 40, 8, 7, 100] {
+            r.set_member(1001, hearing, true, q);
+            r.key(1001, talking).unwrap();
+            assert_eq!(
+                heard_at(&r, talking, hearing),
+                q,
+                "quality {q} arrived on an idle channel and was not applied as given"
+            );
+            r.unkey_as(1001, talking);
+        }
+    }
+
+    /// The talker's own link is held steady too, because they are a member of
+    /// the route they are holding. That is wanted rather than an oversight:
+    /// `source_sink` feeds the BRIDGE leg, which is rebuilt whenever the
+    /// speaker's own rendering changes and flaps in exactly the same way.
+    #[test]
+    fn the_talkers_own_link_is_held_steady_while_they_talk() {
+        let mut r = Router::default();
+        r.open(1001, false);
+        let talking = cli(A, 1);
+        r.set_member(1001, talking, true, 93);
+        r.key(1001, talking).unwrap();
+
+        r.set_member(1001, talking, true, 92);
+        assert_eq!(
+            r.source_sink(1001, talking).quality,
+            93,
+            "the source rendering flapped, which rebuilds the bridge leg mid-word"
+        );
+    }
+
+    /// A patch is one channel, so a listener on the quiet side of it is in a
+    /// transmission just as much as anybody on the side that was keyed.
+    #[test]
+    fn a_listener_across_a_patch_is_steadied_by_the_key_on_the_far_side() {
+        let mut r = Router::default();
+        r.open(1001, false);
+        r.open(4001, false);
+        r.set_patches(vec![vec![1001, 4001]]);
+
+        let talking = cli(A, 1);
+        let across = cli(A, 2);
+        r.set_member(1001, talking, true, 100);
+        r.set_member(4001, across, true, 93);
+        r.key(1001, talking).unwrap();
+
+        r.set_member(4001, across, true, 92);
+        assert_eq!(
+            heard_at(&r, talking, across),
+            93,
+            "4001 was idle in its own right, but the channel it is patched into was not"
         );
     }
 }
